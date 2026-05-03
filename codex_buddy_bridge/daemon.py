@@ -102,9 +102,16 @@ class Daemon:
         if event == "permission_request":
             return await self._handle_permission_request(body)
 
-        # session_start / stop and any other events are accepted but ignored:
-        # we can't drive the buddy display without holding BLE, and holding
-        # BLE is exactly what we mustn't do in on-demand mode.
+        if event == "session_start":
+            # One-shot time sync keeps the clock sane after buddy reboot
+            # without holding a persistent BLE lease.
+            async with self._ble_lock:
+                result = await self._sync_time_once()
+            if not result.get("ok"):
+                self._log.debug("session_start sync skipped: %s", result.get("reason"))
+            return None
+
+        # session_stop and any other events are accepted but ignored.
         self._log.debug("Event %r ignored in on-demand mode", event)
         return None
 
@@ -148,6 +155,7 @@ class Daemon:
             except asyncio.TimeoutError:
                 self._log.warning("Approval %s timed out after %.0fs", request.id, self.config.permission_wait)
                 return {"decision": "timeout"}
+            await self._send_host_time(transport)
             await transport.write_line(build_clear_snapshot())
             return {
                 "decision": "allow" if decision is PermissionDecision.APPROVE_ONCE else "deny",
@@ -159,6 +167,34 @@ class Daemon:
                 self._log.info("Released BLE for %s", request.id)
             except Exception as exc:  # noqa: BLE001
                 self._log.debug("close() raised: %s", exc)
+
+    async def _sync_time_once(self) -> dict[str, Any]:
+        transport = BleTransport(
+            device_name_prefix=self.config.device_prefix,
+            address=self.config.address,
+        )
+        try:
+            await asyncio.wait_for(
+                transport.connect(lambda _line: None, scan_timeout=self.config.connect_timeout),
+                timeout=self.config.connect_timeout + 5.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": str(exc)}
+
+        try:
+            await self._send_greeting(transport)
+            return {"ok": True}
+        finally:
+            try:
+                await transport.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _send_host_time(self, transport: BleTransport) -> None:
+        epoch = int(time.time())
+        tz_offset = -time.timezone if time.daylight == 0 else -time.altzone
+        self._log.debug("Sending host time: epoch=%d tz_offset=%d", epoch, tz_offset)
+        await transport.write_line(build_time_frame(epoch, tz_offset))
 
     async def _consume_decision(
         self,
@@ -178,11 +214,14 @@ class Daemon:
             decision_future.set_result(decision.decision)
 
     async def _send_greeting(self, transport: BleTransport) -> None:
-        epoch = int(time.time())
-        tz_offset = -time.timezone if time.daylight == 0 else -time.altzone
         try:
-            await transport.write_line(build_time_frame(epoch, tz_offset))
+            # Time first, then owner. Re-send time once to avoid a cold-link
+            # first-frame drop leaving the RTC at 00:00 Jan 01.
+            await self._send_host_time(transport)
+            await asyncio.sleep(0.08)
             await transport.write_line(build_owner_frame(_owner_name()))
+            await asyncio.sleep(0.08)
+            await self._send_host_time(transport)
         except Exception as exc:  # noqa: BLE001
             self._log.debug("Greeting frames failed (non-fatal): %s", exc)
 
