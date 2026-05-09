@@ -121,6 +121,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["total"], 2)
         self.assertEqual(snapshot["tokens"], 0)
+        self.assertEqual(snapshot["tokens_today"], 0)
         self.assertEqual(snapshot["running"], 0)
         self.assertEqual(snapshot["waiting"], 0)
         self.assertEqual(transport.close_calls, 1)
@@ -367,6 +368,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "stop never triggered a BLE sync")
         snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
         self.assertEqual(snapshot["tokens"], 125)
+        self.assertEqual(snapshot["tokens_today"], 125)
         self.assertEqual(snapshot["running"], 0)
         self.assertEqual(snapshot["waiting"], 0)
         self.assertEqual(snapshot["msg"], "Codex idle")
@@ -434,6 +436,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertEqual(latest["running"], 1)
         self.assertEqual(latest["total"], 0)
         self.assertEqual(latest["tokens"], 0)
+        self.assertEqual(latest["tokens_today"], 0)
 
     async def test_stop_event_sends_incremental_session_token_delta(self):
         self._write_session_file(
@@ -468,6 +471,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
         self.assertEqual(snapshot["tokens"], 120)
+        self.assertEqual(snapshot["tokens_today"], 120)
 
         await asyncio.to_thread(
             ipc.send_oneshot,
@@ -487,6 +491,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
         self.assertEqual(snapshot["tokens"], 0)
+        self.assertEqual(snapshot["tokens_today"], 120)
 
     async def test_stop_event_only_sends_new_token_growth(self):
         session_path = "2026/05/09/rollout-2026-05-09T00-00-00-s1.jsonl"
@@ -512,6 +517,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         first_snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
         self.assertEqual(first_snapshot["tokens"], 120)
+        self.assertEqual(first_snapshot["tokens_today"], 120)
 
         self._write_session_file(
             session_path,
@@ -538,8 +544,11 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
         self.assertEqual(snapshot["tokens"], 50)
+        self.assertEqual(snapshot["tokens_today"], 170)
         ledger = json.loads(Path(self.config.token_ledger_path).read_text(encoding="utf-8"))
         self.assertEqual(ledger["total_tokens"], 170)
+        self.assertEqual(len(ledger["daily_tokens"]), 1)
+        self.assertEqual(next(iter(ledger["daily_tokens"].values())), 170)
         self.assertEqual(ledger["session_output_totals"]["s1"], 170)
 
     async def test_unknown_events_dont_touch_ble(self):

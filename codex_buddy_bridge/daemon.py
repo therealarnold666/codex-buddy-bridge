@@ -24,6 +24,7 @@ from pathlib import Path
 import pwd
 import signal
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -69,6 +70,7 @@ class SessionState:
         "_turn_session_ids",
         "pending_tokens",
         "total_tokens",
+        "today_tokens",
         "total",
         "waiting",
     )
@@ -77,6 +79,7 @@ class SessionState:
         self.total = 0
         self.pending_tokens = 0
         self.total_tokens = 0
+        self.today_tokens = 0
         self.waiting = 0
         self._active_turn_ids: set[str] = set()
         self._session_turn_ids: dict[str, str] = {}
@@ -104,12 +107,21 @@ class SessionState:
         self.total_tokens = tokens
         return True
 
-    def add_pending_tokens(self, delta: int) -> bool:
+    def set_today_tokens(self, tokens: int) -> bool:
+        tokens = max(0, tokens)
+        if self.today_tokens == tokens:
+            return False
+        self.today_tokens = tokens
+        return True
+
+    def add_pending_tokens(self, delta: int, today_total: int | None = None) -> bool:
         delta = max(0, delta)
         if delta == 0:
             return False
         self.pending_tokens += delta
         self.total_tokens += delta
+        if today_total is not None:
+            self.today_tokens = max(0, today_total)
         return True
 
     def clear_pending_tokens(self) -> None:
@@ -198,6 +210,7 @@ class TokenLedger:
     def __init__(self, path: str):
         self.path = Path(path).expanduser()
         self.total_tokens = 0
+        self.daily_tokens: dict[str, int] = {}
         self.session_output_totals: dict[str, int] = {}
         self.load()
 
@@ -210,9 +223,16 @@ class TokenLedger:
             return
 
         total = payload.get("total_tokens")
+        daily = payload.get("daily_tokens")
         sessions = payload.get("session_output_totals")
         if isinstance(total, int) and total >= 0:
             self.total_tokens = total
+        if isinstance(daily, dict):
+            clean_daily: dict[str, int] = {}
+            for key, value in daily.items():
+                if isinstance(key, str) and isinstance(value, int) and value >= 0:
+                    clean_daily[key] = value
+            self.daily_tokens = clean_daily
         if isinstance(sessions, dict):
             clean: dict[str, int] = {}
             for key, value in sessions.items():
@@ -224,9 +244,13 @@ class TokenLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "total_tokens": self.total_tokens,
+            "daily_tokens": self.daily_tokens,
             "session_output_totals": self.session_output_totals,
         }
         self.path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+    def today_tokens(self) -> int:
+        return self.daily_tokens.get(_local_today_key(), 0)
 
     def record_session_total(self, session_id: str, absolute_total: int) -> int:
         absolute_total = max(0, absolute_total)
@@ -236,6 +260,8 @@ class TokenLedger:
         delta = absolute_total - previous
         self.session_output_totals[session_id] = absolute_total
         self.total_tokens += delta
+        day = _local_today_key()
+        self.daily_tokens[day] = self.daily_tokens.get(day, 0) + delta
         self.save()
         return delta
 
@@ -247,6 +273,7 @@ class Daemon:
         self._session = SessionState()
         self._token_ledger = TokenLedger(config.token_ledger_path)
         self._session.set_total_tokens(self._token_ledger.total_tokens)
+        self._session.set_today_tokens(self._token_ledger.today_tokens())
         self._server: asyncio.AbstractServer | None = None
         self._state_sync_event = asyncio.Event()
         self._state_sync_task: asyncio.Task[None] | None = None
@@ -313,9 +340,10 @@ class Daemon:
             self._session.on_session_start(source)
             await self._rescan_session_total(trigger_sync=True)
             self._log.debug(
-                "Session started: total=%d host_tokens=%d running=%d source=%s",
+                "Session started: total=%d host_tokens=%d tokens_today=%d running=%d source=%s",
                 self._session.total,
                 self._session.total_tokens,
+                self._session.today_tokens,
                 self._session.running,
                 source,
             )
@@ -342,24 +370,26 @@ class Daemon:
             turn_id = _string_or_none(body.get("turn_id"))
             token_delta = await self._collect_stop_token_delta(session_id)
             if token_delta:
-                self._session.add_pending_tokens(token_delta)
+                self._session.add_pending_tokens(token_delta, self._token_ledger.today_tokens())
             if self._session.on_stop(session_id, turn_id):
                 self._log.debug(
-                    "Turn stopped: session=%s turn=%s total=%d delta_tokens=%d host_tokens=%d running=%d",
+                    "Turn stopped: session=%s turn=%s total=%d delta_tokens=%d host_tokens=%d tokens_today=%d running=%d",
                     session_id,
                     turn_id,
                     self._session.total,
                     token_delta,
                     self._session.total_tokens,
+                    self._session.today_tokens,
                     self._session.running,
                 )
                 self._request_state_sync()
             elif token_delta:
                 self._log.debug(
-                    "Turn token update without running change: session=%s delta_tokens=%d host_tokens=%d",
+                    "Turn token update without running change: session=%s delta_tokens=%d host_tokens=%d tokens_today=%d",
                     session_id,
                     token_delta,
                     self._session.total_tokens,
+                    self._session.today_tokens,
                 )
                 self._request_state_sync()
             return None
@@ -405,6 +435,7 @@ class Daemon:
                 waiting=self._session.waiting,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
+                tokens_today=self._session.today_tokens,
             ))
             await transport.write_line(build_prompt_snapshot(
                 request,
@@ -412,13 +443,15 @@ class Daemon:
                 waiting=self._session.waiting,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
+                tokens_today=self._session.today_tokens,
             ))
             self._log.info(
-                "Pending approval %s for %s: %s (total=%d token_delta=%d host_tokens=%d running=%d waiting=%d)",
+                "Pending approval %s for %s: %s (total=%d token_delta=%d host_tokens=%d tokens_today=%d running=%d waiting=%d)",
                 request.id, request.tool, request.hint,
                 self._session.total,
                 self._session.pending_tokens,
                 self._session.total_tokens,
+                self._session.today_tokens,
                 self._session.running,
                 self._session.waiting,
             )
@@ -432,6 +465,7 @@ class Daemon:
                     waiting=self._session.waiting,
                     total=self._session.total,
                     tokens=self._session.pending_tokens,
+                    tokens_today=self._session.today_tokens,
                 ))
                 return {"decision": "timeout"}
             self._session.on_approved()
@@ -440,6 +474,7 @@ class Daemon:
                 waiting=self._session.waiting,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
+                tokens_today=self._session.today_tokens,
             ))
             # Final clear if no more sessions active
             if self._session.is_idle:
@@ -586,14 +621,16 @@ class Daemon:
                     waiting=self._session.waiting,
                     total=self._session.total,
                     tokens=self._session.pending_tokens,
+                    tokens_today=self._session.today_tokens,
                 ))
                 self._last_state_sync_monotonic = asyncio.get_running_loop().time()
                 self._log.debug(
-                    "Pushed state sync (%s): total=%d token_delta=%d host_tokens=%d running=%d waiting=%d",
+                    "Pushed state sync (%s): total=%d token_delta=%d host_tokens=%d tokens_today=%d running=%d waiting=%d",
                     reason,
                     self._session.total,
                     sent_pending_tokens,
                     self._session.total_tokens,
+                    self._session.today_tokens,
                     self._session.running,
                     self._session.waiting,
                 )
@@ -694,6 +731,10 @@ def _find_session_file(scan_path: str, session_id: str) -> Path | None:
         return None
     matches = sorted(root.rglob(f"*{session_id}*.jsonl"))
     return matches[-1] if matches else None
+
+
+def _local_today_key() -> str:
+    return datetime.now().astimezone().date().isoformat()
 
 
 def _owner_name() -> str:
