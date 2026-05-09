@@ -5,8 +5,9 @@
 #   1. Creates a venv and installs bleak.
 #   2. Renders the launchd plist with absolute paths and loads it.
 #   3. Enables [features] codex_hooks = true in ~/.codex/config.toml.
-#   4. Writes ~/.codex/hooks.json with a PermissionRequest entry pointing
-#      at hooks/permission_request.py. Existing hooks.json is backed up.
+#   4. Writes ~/.codex/hooks.json with PermissionRequest + SessionStart +
+#      UserPromptSubmit + Stop
+#      entries pointing at hooks/*.py. Existing hooks.json is backed up.
 #
 # Re-running this script is idempotent.
 
@@ -79,7 +80,13 @@ fi
 
 step "Writing ${HOOKS_JSON}"
 PERM_HOOK="${BRIDGE_ROOT}/hooks/permission_request.py"
+SESSION_HOOK="${BRIDGE_ROOT}/hooks/session_start.py"
+PROMPT_HOOK="${BRIDGE_ROOT}/hooks/user_prompt_submit.py"
+STOP_HOOK="${BRIDGE_ROOT}/hooks/stop.py"
 chmod +x "${PERM_HOOK}"
+chmod +x "${SESSION_HOOK}"
+chmod +x "${PROMPT_HOOK}"
+chmod +x "${STOP_HOOK}"
 
 if [[ -f "${HOOKS_JSON}" ]]; then
     cp "${HOOKS_JSON}" "${HOOKS_JSON}.bak.$(date +%s)"
@@ -98,6 +105,42 @@ cat > "${HOOKS_JSON}" <<EOF
             "command": "${PERM_HOOK}",
             "timeout": 115,
             "statusMessage": "ClaudeCodeBuddy approval"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${SESSION_HOOK}",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PROMPT_HOOK}",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${STOP_HOOK}",
+            "timeout": 3
           }
         ]
       }

@@ -70,6 +70,12 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.transport_factory.stop()
+        if self.daemon._state_sync_task is not None:
+            self.daemon._state_sync_task.cancel()
+            try:
+                await self.daemon._state_sync_task
+            except asyncio.CancelledError:
+                pass
         self.server.close()
         await self.server.wait_closed()
         try:
@@ -80,6 +86,78 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
 
 
 class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
+    async def test_session_start_pushes_running_state_over_ble(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "session_start", "payload": {"session_id": "s1", "cwd": "/repo", "source": "startup"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        self.assertTrue(FakeBleTransport.instances, "session_start never triggered a BLE sync")
+        transport = FakeBleTransport.instances[-1]
+        self.assertTrue(any('"time"' in line for line in transport.lines), "missing time frame")
+        self.assertTrue(any('"cmd":"owner"' in line for line in transport.lines), "missing owner frame")
+
+        snapshot = json.loads(transport.lines[-1])
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["waiting"], 0)
+        self.assertEqual(transport.close_calls, 1)
+
+    async def test_running_state_heartbeats_while_session_is_active(self):
+        self.daemon.config.state_sync_interval = 0.05
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2:
+                break
+
+        self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "expected a heartbeat sync after initial state push")
+        for transport in FakeBleTransport.instances[:2]:
+            snapshot = json.loads(transport.lines[-1])
+            self.assertEqual(snapshot["running"], 1)
+            self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_user_prompt_submit_pushes_running_state_over_ble(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        self.assertTrue(FakeBleTransport.instances, "user_prompt_submit never triggered a BLE sync")
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+        self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_duplicate_user_prompt_submit_does_not_double_count_turn(self):
+        event = {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}}
+        await asyncio.to_thread(ipc.send_oneshot, self.socket_path, event)
+        await asyncio.to_thread(ipc.send_oneshot, self.socket_path, event)
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+
     async def test_approval_round_trip_acquires_then_releases_ble(self):
         async def fire_request():
             return await asyncio.to_thread(
@@ -189,16 +267,40 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         # Even on timeout, BLE is released.
         self.assertEqual(FakeBleTransport.instances[-1].close_calls, 1)
 
-    async def test_session_start_and_stop_events_dont_touch_ble(self):
+    async def test_stop_event_pushes_idle_state_over_ble(self):
         await asyncio.to_thread(
             ipc.send_oneshot,
             self.socket_path,
-            {"event": "session_start", "payload": {"session_id": "s1", "cwd": "/repo", "source": "startup"}},
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
         )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
         await asyncio.to_thread(
             ipc.send_oneshot,
             self.socket_path,
-            {"event": "stop", "payload": {"session_id": "s1", "stop_reason": "done"}},
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t1", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "stop never triggered a BLE sync")
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["waiting"], 0)
+        self.assertEqual(snapshot["msg"], "Codex idle")
+
+    async def test_unknown_events_dont_touch_ble(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "bogus", "payload": {"session_id": "s1"}},
         )
         # Give the server a moment to dispatch.
         await asyncio.sleep(0.1)
