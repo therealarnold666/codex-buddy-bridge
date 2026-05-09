@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import pwd
 import signal
 import time
@@ -46,34 +47,92 @@ DEFAULT_PERMISSION_WAIT_SECONDS = 105.0  # < hook timeout (115s) in hooks.json
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 8.0    # short scan/connect window so the hook
                                          # can give up quickly if Claude has the buddy
 DEFAULT_STATE_SYNC_INTERVAL_SECONDS = 12.0
+DEFAULT_IDLE_STATE_SYNC_INTERVAL_SECONDS = 60.0
 DEFAULT_STATE_SYNC_CONNECT_TIMEOUT_SECONDS = 3.0
+DEFAULT_SESSION_RESCAN_INTERVAL_SECONDS = 60.0
+DEFAULT_SESSION_SCAN_PATH = os.path.expanduser("~/.codex/sessions")
+DEFAULT_TOKEN_LEDGER_PATH = os.path.expanduser("~/.local/state/codex-buddy/token-ledger.json")
 
 
 class SessionState:
     """Tracks total/running/waiting across session and turn hooks.
 
-    `total` is the number of sessions started during this daemon lifetime.
+    `total` is the number of on-disk Codex session files currently present.
     `running` reflects active turns: UserPromptSubmit marks a turn active and
     Stop clears it again.
     """
 
-    __slots__ = ("_active_turn_ids", "_anonymous_running", "total", "waiting")
+    __slots__ = (
+        "_active_turn_ids",
+        "_anonymous_running",
+        "_session_turn_ids",
+        "_turn_session_ids",
+        "pending_tokens",
+        "total_tokens",
+        "total",
+        "waiting",
+    )
 
     def __init__(self) -> None:
         self.total = 0
+        self.pending_tokens = 0
+        self.total_tokens = 0
         self.waiting = 0
         self._active_turn_ids: set[str] = set()
+        self._session_turn_ids: dict[str, str] = {}
+        self._turn_session_ids: dict[str, str] = {}
         self._anonymous_running = 0
 
     def on_session_start(self, source: str) -> None:
-        self.total += 1
         if source == "clear":
             self._active_turn_ids.clear()
+            self._session_turn_ids.clear()
+            self._turn_session_ids.clear()
             self._anonymous_running = 0
 
-    def on_user_prompt_submit(self, turn_id: str | None) -> bool:
+    def set_total(self, total: int) -> bool:
+        total = max(0, total)
+        if self.total == total:
+            return False
+        self.total = total
+        return True
+
+    def set_total_tokens(self, tokens: int) -> bool:
+        tokens = max(0, tokens)
+        if self.total_tokens == tokens:
+            return False
+        self.total_tokens = tokens
+        return True
+
+    def add_pending_tokens(self, delta: int) -> bool:
+        delta = max(0, delta)
+        if delta == 0:
+            return False
+        self.pending_tokens += delta
+        self.total_tokens += delta
+        return True
+
+    def clear_pending_tokens(self) -> None:
+        self.pending_tokens = 0
+
+    def on_user_prompt_submit(self, session_id: str | None, turn_id: str | None) -> bool:
         if turn_id:
-            if turn_id in self._active_turn_ids:
+            replaced = False
+            if session_id:
+                previous_turn_id = self._session_turn_ids.get(session_id)
+                if previous_turn_id == turn_id:
+                    return False
+                if previous_turn_id:
+                    self._active_turn_ids.discard(previous_turn_id)
+                    self._turn_session_ids.pop(previous_turn_id, None)
+                    replaced = True
+                self._session_turn_ids[session_id] = turn_id
+                self._turn_session_ids[turn_id] = session_id
+            elif turn_id in self._active_turn_ids:
+                return False
+            elif turn_id in self._turn_session_ids:
+                return False
+            if turn_id in self._active_turn_ids and not replaced:
                 return False
             self._active_turn_ids.add(turn_id)
             return True
@@ -87,10 +146,22 @@ class SessionState:
         if self.waiting > 0:
             self.waiting -= 1
 
-    def on_stop(self, turn_id: str | None) -> bool:
-        if turn_id and turn_id in self._active_turn_ids:
-            self._active_turn_ids.remove(turn_id)
-            return True
+    def on_stop(self, session_id: str | None, turn_id: str | None) -> bool:
+        if turn_id:
+            mapped_session_id = self._turn_session_ids.pop(turn_id, None)
+            if mapped_session_id and self._session_turn_ids.get(mapped_session_id) == turn_id:
+                self._session_turn_ids.pop(mapped_session_id, None)
+            if session_id and self._session_turn_ids.get(session_id) == turn_id:
+                self._session_turn_ids.pop(session_id, None)
+            if turn_id in self._active_turn_ids:
+                self._active_turn_ids.remove(turn_id)
+                return True
+        if session_id:
+            previous_turn_id = self._session_turn_ids.pop(session_id, None)
+            if previous_turn_id:
+                self._turn_session_ids.pop(previous_turn_id, None)
+                self._active_turn_ids.discard(previous_turn_id)
+                return True
         if self._anonymous_running > 0:
             self._anonymous_running -= 1
             return True
@@ -116,7 +187,57 @@ class DaemonConfig:
     permission_wait: float = DEFAULT_PERMISSION_WAIT_SECONDS
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
     state_sync_interval: float = DEFAULT_STATE_SYNC_INTERVAL_SECONDS
+    idle_state_sync_interval: float = DEFAULT_IDLE_STATE_SYNC_INTERVAL_SECONDS
     state_sync_connect_timeout: float = DEFAULT_STATE_SYNC_CONNECT_TIMEOUT_SECONDS
+    session_rescan_interval: float = DEFAULT_SESSION_RESCAN_INTERVAL_SECONDS
+    session_scan_path: str = DEFAULT_SESSION_SCAN_PATH
+    token_ledger_path: str = DEFAULT_TOKEN_LEDGER_PATH
+
+
+class TokenLedger:
+    def __init__(self, path: str):
+        self.path = Path(path).expanduser()
+        self.total_tokens = 0
+        self.session_output_totals: dict[str, int] = {}
+        self.load()
+
+    def load(self) -> None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            return
+
+        total = payload.get("total_tokens")
+        sessions = payload.get("session_output_totals")
+        if isinstance(total, int) and total >= 0:
+            self.total_tokens = total
+        if isinstance(sessions, dict):
+            clean: dict[str, int] = {}
+            for key, value in sessions.items():
+                if isinstance(key, str) and isinstance(value, int) and value >= 0:
+                    clean[key] = value
+            self.session_output_totals = clean
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "total_tokens": self.total_tokens,
+            "session_output_totals": self.session_output_totals,
+        }
+        self.path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+    def record_session_total(self, session_id: str, absolute_total: int) -> int:
+        absolute_total = max(0, absolute_total)
+        previous = self.session_output_totals.get(session_id, 0)
+        if absolute_total <= previous:
+            return 0
+        delta = absolute_total - previous
+        self.session_output_totals[session_id] = absolute_total
+        self.total_tokens += delta
+        self.save()
+        return delta
 
 
 class Daemon:
@@ -124,9 +245,12 @@ class Daemon:
         self.config = config
         self._ble_lock = asyncio.Lock()
         self._session = SessionState()
+        self._token_ledger = TokenLedger(config.token_ledger_path)
+        self._session.set_total_tokens(self._token_ledger.total_tokens)
         self._server: asyncio.AbstractServer | None = None
         self._state_sync_event = asyncio.Event()
         self._state_sync_task: asyncio.Task[None] | None = None
+        self._session_scan_task: asyncio.Task[None] | None = None
         self._last_state_sync_monotonic = 0.0
         self._stop_event = asyncio.Event()
         self._log = logging.getLogger("codex-buddy.daemon")
@@ -160,6 +284,12 @@ class Daemon:
                 await self._state_sync_task
             except asyncio.CancelledError:
                 pass
+        if self._session_scan_task is not None:
+            self._session_scan_task.cancel()
+            try:
+                await self._session_scan_task
+            except asyncio.CancelledError:
+                pass
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -181,20 +311,25 @@ class Daemon:
             self._ensure_background_tasks()
             source = body.get("source", "startup")
             self._session.on_session_start(source)
+            await self._rescan_session_total(trigger_sync=True)
             self._log.debug(
-                "Session started: total=%d running=%d source=%s",
-                self._session.total, self._session.running, source,
+                "Session started: total=%d host_tokens=%d running=%d source=%s",
+                self._session.total,
+                self._session.total_tokens,
+                self._session.running,
+                source,
             )
             self._request_state_sync()
             return None
 
         if event == "user_prompt_submit":
             self._ensure_background_tasks()
+            session_id = _string_or_none(body.get("session_id"))
             turn_id = _string_or_none(body.get("turn_id"))
-            if self._session.on_user_prompt_submit(turn_id):
+            if self._session.on_user_prompt_submit(session_id, turn_id):
                 self._log.debug(
                     "Turn started: session=%s turn=%s running=%d",
-                    body.get("session_id"),
+                    session_id,
                     turn_id,
                     self._session.running,
                 )
@@ -203,14 +338,28 @@ class Daemon:
 
         if event == "stop":
             self._ensure_background_tasks()
+            session_id = _string_or_none(body.get("session_id"))
             turn_id = _string_or_none(body.get("turn_id"))
-            if self._session.on_stop(turn_id):
+            token_delta = await self._collect_stop_token_delta(session_id)
+            if token_delta:
+                self._session.add_pending_tokens(token_delta)
+            if self._session.on_stop(session_id, turn_id):
                 self._log.debug(
-                    "Turn stopped: session=%s turn=%s total=%d running=%d",
-                    body.get("session_id"),
+                    "Turn stopped: session=%s turn=%s total=%d delta_tokens=%d host_tokens=%d running=%d",
+                    session_id,
                     turn_id,
                     self._session.total,
+                    token_delta,
+                    self._session.total_tokens,
                     self._session.running,
+                )
+                self._request_state_sync()
+            elif token_delta:
+                self._log.debug(
+                    "Turn token update without running change: session=%s delta_tokens=%d host_tokens=%d",
+                    session_id,
+                    token_delta,
+                    self._session.total_tokens,
                 )
                 self._request_state_sync()
             return None
@@ -255,17 +404,23 @@ class Daemon:
                 running=self._session.running,
                 waiting=self._session.waiting,
                 total=self._session.total,
+                tokens=self._session.pending_tokens,
             ))
             await transport.write_line(build_prompt_snapshot(
                 request,
                 running=self._session.running,
                 waiting=self._session.waiting,
                 total=self._session.total,
+                tokens=self._session.pending_tokens,
             ))
             self._log.info(
-                "Pending approval %s for %s: %s (total=%d running=%d waiting=%d)",
+                "Pending approval %s for %s: %s (total=%d token_delta=%d host_tokens=%d running=%d waiting=%d)",
                 request.id, request.tool, request.hint,
-                self._session.total, self._session.running, self._session.waiting,
+                self._session.total,
+                self._session.pending_tokens,
+                self._session.total_tokens,
+                self._session.running,
+                self._session.waiting,
             )
             try:
                 decision = await asyncio.wait_for(decision_future, timeout=self.config.permission_wait)
@@ -276,6 +431,7 @@ class Daemon:
                     running=self._session.running,
                     waiting=self._session.waiting,
                     total=self._session.total,
+                    tokens=self._session.pending_tokens,
                 ))
                 return {"decision": "timeout"}
             self._session.on_approved()
@@ -283,6 +439,7 @@ class Daemon:
                 running=self._session.running,
                 waiting=self._session.waiting,
                 total=self._session.total,
+                tokens=self._session.pending_tokens,
             ))
             # Final clear if no more sessions active
             if self._session.is_idle:
@@ -331,17 +488,57 @@ class Daemon:
                 self._state_sync_loop(),
                 name="codex-buddy-state-sync",
             )
+        if self._session_scan_task is None or self._session_scan_task.done():
+            self._session_scan_task = asyncio.create_task(
+                self._session_scan_loop(),
+                name="codex-buddy-session-scan",
+            )
 
     def _request_state_sync(self) -> None:
         self._state_sync_event.set()
 
+    async def _session_scan_loop(self) -> None:
+        await self._rescan_session_total(trigger_sync=True)
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self.config.session_rescan_interval,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+            await self._rescan_session_total(trigger_sync=False)
+
+    async def _rescan_session_total(self, trigger_sync: bool) -> None:
+        total = await asyncio.to_thread(_count_session_files, self.config.session_scan_path)
+        changed = self._session.set_total(total)
+        if changed:
+            self._log.debug("Session total refreshed from disk: total=%d", total)
+            if trigger_sync:
+                self._request_state_sync()
+
+    async def _collect_stop_token_delta(self, session_id: str | None) -> int:
+        if not session_id:
+            return 0
+        session_path = await asyncio.to_thread(_find_session_file, self.config.session_scan_path, session_id)
+        if session_path is None:
+            self._log.debug("No session file found for token scan: session=%s", session_id)
+            return 0
+        absolute_total = await asyncio.to_thread(_scan_session_output_tokens, session_path)
+        delta = await asyncio.to_thread(self._token_ledger.record_session_total, session_id, absolute_total)
+        return delta
+
     async def _state_sync_loop(self) -> None:
         loop = asyncio.get_running_loop()
         while not self._stop_event.is_set():
-            timeout = None
-            if self._session.running > 0:
-                elapsed = loop.time() - self._last_state_sync_monotonic
-                timeout = max(0.0, self.config.state_sync_interval - elapsed)
+            interval = (
+                self.config.state_sync_interval
+                if self._session.running > 0
+                else self.config.idle_state_sync_interval
+            )
+            elapsed = loop.time() - self._last_state_sync_monotonic
+            timeout = max(0.0, interval - elapsed)
 
             triggered = False
             try:
@@ -356,9 +553,6 @@ class Daemon:
             if self._stop_event.is_set():
                 break
 
-            if not triggered and self._session.running <= 0:
-                continue
-
             reason = "event" if triggered else "heartbeat"
             await self._sync_state_once(reason)
 
@@ -367,6 +561,7 @@ class Daemon:
             self._log.debug("Skipping %s state sync while BLE is busy", reason)
             return
 
+        sent_pending_tokens = self._session.pending_tokens
         async with self._ble_lock:
             transport = BleTransport(
                 device_name_prefix=self.config.device_prefix,
@@ -390,15 +585,20 @@ class Daemon:
                     running=self._session.running,
                     waiting=self._session.waiting,
                     total=self._session.total,
+                    tokens=self._session.pending_tokens,
                 ))
                 self._last_state_sync_monotonic = asyncio.get_running_loop().time()
                 self._log.debug(
-                    "Pushed state sync (%s): total=%d running=%d waiting=%d",
+                    "Pushed state sync (%s): total=%d token_delta=%d host_tokens=%d running=%d waiting=%d",
                     reason,
                     self._session.total,
+                    sent_pending_tokens,
+                    self._session.total_tokens,
                     self._session.running,
                     self._session.waiting,
                 )
+                if sent_pending_tokens > 0:
+                    self._session.clear_pending_tokens()
             finally:
                 try:
                     await transport.close()
@@ -451,6 +651,49 @@ def _string_or_none(value: Any) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _count_session_files(scan_path: str) -> int:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return 0
+    return sum(1 for path in root.rglob("*.jsonl") if path.is_file())
+
+
+def _scan_session_output_tokens(path: Path) -> int:
+    best = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if '"type":"token_count"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info")
+                if not isinstance(info, dict):
+                    continue
+                total_usage = info.get("total_token_usage")
+                if not isinstance(total_usage, dict):
+                    continue
+                output_tokens = total_usage.get("output_tokens")
+                if isinstance(output_tokens, int) and output_tokens > best:
+                    best = output_tokens
+    except OSError:
+        return 0
+    return best
+
+
+def _find_session_file(scan_path: str, session_id: str) -> Path | None:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return None
+    matches = sorted(root.rglob(f"*{session_id}*.jsonl"))
+    return matches[-1] if matches else None
 
 
 def _owner_name() -> str:

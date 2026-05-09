@@ -35,12 +35,14 @@ def build_prompt_snapshot(
     running: int = 0,
     waiting: int = 1,
     total: int = 1,
+    tokens: int = 0,
 ) -> str:
     return _encode_line(
         {
             "total": total,
             "running": running,
             "waiting": waiting,
+            "tokens": tokens,
             "msg": _truncate(f"approve: {approval.tool}", PROMPT_TOOL_LIMIT + 9),
             "prompt": {
                 "id": approval.id,
@@ -67,12 +69,14 @@ def build_session_state_snapshot(
     running: int = 0,
     waiting: int = 0,
     total: int = 0,
+    tokens: int = 0,
 ) -> str:
     return _encode_line(
         {
             "total": total,
             "running": running,
             "waiting": waiting,
+            "tokens": tokens,
             "completed": False,
             "msg": "Codex running" if running else "Codex idle",
         }
