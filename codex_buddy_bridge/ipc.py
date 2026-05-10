@@ -110,5 +110,9 @@ def send_and_wait(
 def _connect(socket_path: str, timeout: float) -> socket.socket:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
-    sock.connect(socket_path)
-    return sock
+    try:
+        sock.connect(socket_path)
+        return sock
+    except Exception:
+        sock.close()
+        raise

@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from codex_buddy_bridge import daemon as daemon_module
@@ -64,22 +66,169 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
             address=None,
             permission_wait=2.0,
             connect_timeout=2.0,
+            idle_state_sync_interval=0.05,
+            session_scan_path=os.path.join(self.tmpdir, "sessions"),
+            session_rescan_interval=0.05,
+            token_ledger_path=os.path.join(self.tmpdir, "token-ledger.json"),
         )
+        Path(self.config.session_scan_path).mkdir(parents=True, exist_ok=True)
         self.daemon = Daemon(self.config)
         self.server = await ipc.serve(self.socket_path, self.daemon._handle_event)
 
     async def asyncTearDown(self):
         self.transport_factory.stop()
+        if self.daemon._state_sync_task is not None:
+            self.daemon._state_sync_task.cancel()
+            try:
+                await self.daemon._state_sync_task
+            except asyncio.CancelledError:
+                pass
         self.server.close()
         await self.server.wait_closed()
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
             pass
-        os.rmdir(self.tmpdir)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
 class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
+    def _write_session_file(self, relative_path: str, content: str = "{}\n") -> None:
+        path = Path(self.config.session_scan_path) / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    async def test_session_start_pushes_running_state_over_ble(self):
+        self._write_session_file("2026/05/09/one.jsonl")
+        self._write_session_file("2026/05/09/two.jsonl")
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "session_start", "payload": {"session_id": "s1", "cwd": "/repo", "source": "startup"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        self.assertTrue(FakeBleTransport.instances, "session_start never triggered a BLE sync")
+        transport = FakeBleTransport.instances[-1]
+        self.assertTrue(any('"time"' in line for line in transport.lines), "missing time frame")
+        self.assertTrue(any('"cmd":"owner"' in line for line in transport.lines), "missing owner frame")
+
+        snapshot = json.loads(transport.lines[-1])
+        self.assertEqual(snapshot["total"], 2)
+        self.assertEqual(snapshot["tokens"], 0)
+        self.assertEqual(snapshot["tokens_today"], 0)
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["waiting"], 0)
+        self.assertEqual(transport.close_calls, 1)
+
+    async def test_running_state_heartbeats_while_session_is_active(self):
+        self.daemon.config.state_sync_interval = 0.05
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2:
+                break
+
+        self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "expected a heartbeat sync after initial state push")
+        for transport in FakeBleTransport.instances[:2]:
+            snapshot = json.loads(transport.lines[-1])
+            self.assertEqual(snapshot["running"], 1)
+            self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_idle_state_heartbeats_without_user_events(self):
+        self._write_session_file("2026/05/09/one.jsonl")
+
+        self.daemon._ensure_background_tasks()
+
+        for _ in range(120):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2:
+                break
+
+        self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "expected repeated idle heartbeats")
+        for transport in FakeBleTransport.instances[:2]:
+            snapshot = json.loads(transport.lines[-1])
+            self.assertEqual(snapshot["running"], 0)
+            self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_user_prompt_submit_pushes_running_state_over_ble(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        self.assertTrue(FakeBleTransport.instances, "user_prompt_submit never triggered a BLE sync")
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+        self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_duplicate_user_prompt_submit_does_not_double_count_turn(self):
+        event = {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}}
+        await asyncio.to_thread(ipc.send_oneshot, self.socket_path, event)
+        await asyncio.to_thread(ipc.send_oneshot, self.socket_path, event)
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+
+    async def test_new_turn_in_same_session_replaces_stale_turn(self):
+        self.daemon.config.state_sync_interval = 0.05
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t2"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t2", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["msg"], "Codex idle")
+
     async def test_approval_round_trip_acquires_then_releases_ble(self):
         async def fire_request():
             return await asyncio.to_thread(
@@ -189,16 +338,224 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         # Even on timeout, BLE is released.
         self.assertEqual(FakeBleTransport.instances[-1].close_calls, 1)
 
-    async def test_session_start_and_stop_events_dont_touch_ble(self):
-        await asyncio.to_thread(
-            ipc.send_oneshot,
-            self.socket_path,
-            {"event": "session_start", "payload": {"session_id": "s1", "cwd": "/repo", "source": "startup"}},
+    async def test_stop_event_pushes_idle_state_over_ble(self):
+        self._write_session_file(
+            "2026/05/09/rollout-2026-05-09T00-00-00-s1.jsonl",
+            '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":125}}}}\n',
         )
         await asyncio.to_thread(
             ipc.send_oneshot,
             self.socket_path,
-            {"event": "stop", "payload": {"session_id": "s1", "stop_reason": "done"}},
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t1", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "stop never triggered a BLE sync")
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["tokens"], 125)
+        self.assertEqual(snapshot["tokens_today"], 125)
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["waiting"], 0)
+        self.assertEqual(snapshot["msg"], "Codex idle")
+
+    async def test_stop_without_turn_id_clears_session_turn(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "stop_reason": "interrupted"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["msg"], "Codex idle")
+
+    async def test_background_rescan_updates_total_for_next_heartbeat(self):
+        self._write_session_file("2026/05/09/one.jsonl")
+        self.daemon.config.state_sync_interval = 0.05
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if any(json.loads(t.lines[-1])["total"] == 1 for t in FakeBleTransport.instances if t.lines):
+                break
+
+        first = next(
+            json.loads(t.lines[-1])
+            for t in FakeBleTransport.instances
+            if t.lines and json.loads(t.lines[-1])["total"] == 1
+        )
+        self.assertEqual(first["total"], 1)
+
+        session_file = Path(self.config.session_scan_path) / "2026/05/09/one.jsonl"
+        session_file.unlink()
+
+        for _ in range(120):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2:
+                latest = json.loads(FakeBleTransport.instances[-1].lines[-1])
+                if latest["total"] == 0:
+                    break
+
+        latest = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(latest["running"], 1)
+        self.assertEqual(latest["total"], 0)
+        self.assertEqual(latest["tokens"], 0)
+        self.assertEqual(latest["tokens_today"], 0)
+
+    async def test_stop_event_sends_incremental_session_token_delta(self):
+        self._write_session_file(
+            "2026/05/09/rollout-2026-05-09T00-00-00-s1.jsonl",
+            (
+                '{"type":"event_msg","payload":{"type":"token_count","info":null}}\n'
+                '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":120}}}}\n'
+                '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":90}}}}\n'
+            ),
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t1", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["tokens"], 120)
+        self.assertEqual(snapshot["tokens_today"], 120)
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t2"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t2", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 4 and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["tokens"], 0)
+        self.assertEqual(snapshot["tokens_today"], 120)
+
+    async def test_stop_event_only_sends_new_token_growth(self):
+        session_path = "2026/05/09/rollout-2026-05-09T00-00-00-s1.jsonl"
+        self._write_session_file(
+            session_path,
+            '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":120}}}}\n',
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t1", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        first_snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(first_snapshot["tokens"], 120)
+        self.assertEqual(first_snapshot["tokens_today"], 120)
+
+        self._write_session_file(
+            session_path,
+            (
+                '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":120}}}}\n'
+                '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":170}}}}\n'
+            ),
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t2"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t2", "stop_reason": "done"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["tokens"], 50)
+        self.assertEqual(snapshot["tokens_today"], 170)
+        ledger = json.loads(Path(self.config.token_ledger_path).read_text(encoding="utf-8"))
+        self.assertEqual(ledger["total_tokens"], 170)
+        self.assertEqual(len(ledger["daily_tokens"]), 1)
+        self.assertEqual(next(iter(ledger["daily_tokens"].values())), 170)
+        self.assertEqual(ledger["session_output_totals"]["s1"], 170)
+
+    async def test_unknown_events_dont_touch_ble(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "bogus", "payload": {"session_id": "s1"}},
         )
         # Give the server a moment to dispatch.
         await asyncio.sleep(0.1)

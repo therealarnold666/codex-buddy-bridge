@@ -29,6 +29,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(data["total"], 1)
         self.assertEqual(data["running"], 0)
         self.assertEqual(data["waiting"], 1)
+        self.assertEqual(data["tokens"], 0)
+        self.assertEqual(data["tokens_today"], 0)
         self.assertEqual(data["prompt"]["id"], "codex-1")
         self.assertEqual(data["prompt"]["tool"], "shell command that")
         self.assertEqual(data["prompt"]["hint"], "Allow command: pio run --environment m5stic")
