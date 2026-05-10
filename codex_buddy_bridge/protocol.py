@@ -11,10 +11,10 @@ PROMPT_ID_LIMIT = 39  # firmware src/data.h: char promptId[40] (39 + null)
 ENTRY_LIMIT = 5
 ENTRY_TEXT_LIMIT = 60
 INTERACTIVE_ID_LIMIT = 31
-INTERACTIVE_HEADER_LIMIT = 16
+INTERACTIVE_HEADER_LIMIT = 40
 INTERACTIVE_QUESTION_LIMIT = 4
 INTERACTIVE_OPTION_LIMIT = 4
-INTERACTIVE_TEXT_LIMIT = 80
+INTERACTIVE_TEXT_LIMIT = 140
 
 
 @dataclass(frozen=True)
@@ -50,13 +50,17 @@ class InteractivePrompt:
     thread_id: str
     turn_id: str
     session_id: str
+    status: str
+    question_index: int
+    question_total: int
     questions: tuple[InteractiveQuestion, ...]
 
 
 @dataclass(frozen=True)
 class InteractiveSelection:
     id: str
-    answers: tuple[int, ...]
+    question_index: int
+    answer: int
 
 
 def build_prompt_snapshot(
@@ -166,15 +170,11 @@ def parse_interactive_selection(line: str | bytes) -> InteractiveSelection | Non
     if obj is None or obj.get("cmd") != "interactive_select":
         return None
     prompt_id = obj.get("id")
-    answers = obj.get("answers")
-    if not isinstance(prompt_id, str) or not isinstance(answers, list):
+    question_index = obj.get("question_index")
+    answer = obj.get("answer")
+    if not isinstance(prompt_id, str) or not isinstance(question_index, int) or not isinstance(answer, int):
         return None
-    clean: list[int] = []
-    for value in answers:
-        if not isinstance(value, int):
-            return None
-        clean.append(value)
-    return InteractiveSelection(id=prompt_id, answers=tuple(clean))
+    return InteractiveSelection(id=prompt_id, question_index=question_index, answer=answer)
 
 
 def truncate_entry(text: str) -> str:
@@ -190,7 +190,9 @@ def _interactive_payload(prompt: InteractivePrompt) -> dict[str, Any]:
         "id": _truncate(prompt.id, INTERACTIVE_ID_LIMIT),
         "call_id": _truncate(prompt.call_id, INTERACTIVE_ID_LIMIT),
         "turn_id": _truncate(prompt.turn_id, PROMPT_ID_LIMIT),
-        "question_count": len(prompt.questions),
+        "status": _truncate(prompt.status, 16),
+        "question_count": prompt.question_total,
+        "question_index": prompt.question_index,
         "questions": [
             {
                 "id": _truncate(question.id, INTERACTIVE_ID_LIMIT),

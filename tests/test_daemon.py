@@ -52,6 +52,25 @@ class FakeBleTransport:
             await result
 
 
+class FakeRouterClient:
+    def __init__(self):
+        self.started = 0
+        self.stopped = 0
+        self.is_connected = True
+        self.submit_ok = True
+        self.submissions: list[tuple[object, tuple[int | None, ...]]] = []
+
+    def start(self) -> None:
+        self.started += 1
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def submit_user_input_response(self, prompt, answers):
+        self.submissions.append((prompt, answers))
+        return self.submit_ok
+
+
 class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         FakeBleTransport.instances.clear()
@@ -73,6 +92,7 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
         )
         Path(self.config.session_scan_path).mkdir(parents=True, exist_ok=True)
         self.daemon = Daemon(self.config)
+        self.daemon._router = FakeRouterClient()
         self.server = await ipc.serve(self.socket_path, self.daemon._handle_event)
 
     async def asyncTearDown(self):
@@ -558,6 +578,61 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertTrue(changed)
         self.assertEqual(self.daemon._session.waiting_out, 0)
 
+    async def test_interactive_inferred_from_recent_tail_on_first_scan(self):
+        sid = "99999999-2222-3333-4444-555555555555"
+        path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-05-00-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "turn_context", "payload": {"turn_id": "t-recent"}}),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "name": "request_user_input",
+                                "arguments": json.dumps(
+                                    {
+                                        "threadId": sid,
+                                        "questions": [
+                                            {
+                                                "header": "Mode",
+                                                "id": "mode",
+                                                "question": "Which mode?",
+                                                "options": [
+                                                    {"label": "Fast", "description": "fast"},
+                                                    {"label": "Safe", "description": "safe"},
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ),
+                                "call_id": "call-recent",
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(self.daemon._session.waiting_out, 1)
+        self.daemon._refresh_interactive_snapshot()
+        self.assertIsNotNone(self.daemon._interactive_snapshot.prompt)
+        self.assertEqual(self.daemon._interactive_snapshot.prompt.turn_id, "t-recent")
+
     async def test_interactive_inferred_end_on_turn_aborted(self):
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
@@ -610,7 +685,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertTrue(changed)
         self.assertEqual(self.daemon._session.waiting_out, 0)
 
-    async def test_interactive_selection_submits_function_call_output(self):
+    async def test_interactive_selection_advances_then_submits_live_user_input(self):
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -676,19 +751,136 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertTrue(FakeBleTransport.instances)
         self.assertTrue(any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines))
         prompt_id = self.daemon._interactive_snapshot.prompt.id
+        self.assertEqual(self.daemon._interactive_snapshot.prompt.question_index, 0)
+        self.assertEqual(self.daemon._interactive_snapshot.prompt.question_total, 2)
+        self.assertEqual(self.daemon._interactive_snapshot.prompt.status, "input")
 
-        with patch.object(self.daemon, "_send_app_server_request", return_value=True) as submit:
-            await FakeBleTransport.instances[-1].deliver(
-                json.dumps({"cmd": "interactive_select", "id": prompt_id, "answers": [1, 0]}).encode() + b"\n"
+        await FakeBleTransport.instances[-1].deliver(
+            json.dumps({"cmd": "interactive_select", "id": prompt_id, "question_index": 0, "answer": 1}).encode() + b"\n"
+        )
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            prompt = self.daemon._interactive_snapshot.prompt
+            if prompt is not None and prompt.question_index == 1:
+                break
+
+        prompt = self.daemon._interactive_snapshot.prompt
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt.question_index, 1)
+        self.assertEqual(prompt.questions[0].id, "mode")
+        self.assertEqual(self.daemon._router.submissions, [])
+
+        await FakeBleTransport.instances[-1].deliver(
+            json.dumps({"cmd": "interactive_select", "id": prompt_id, "question_index": 1, "answer": 0}).encode() + b"\n"
+        )
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            prompt = self.daemon._interactive_snapshot.prompt
+            if prompt is not None and prompt.status == "submitting":
+                break
+
+        prompt = self.daemon._interactive_snapshot.prompt
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt.status, "submitting")
+        self.assertEqual(self.daemon._session.waiting_out, 1)
+        self.assertEqual(len(self.daemon._router.submissions), 1)
+        submitted_prompt, submitted_answers = self.daemon._router.submissions[0]
+        self.assertEqual(submitted_prompt.call_id, "call-3")
+        self.assertEqual(submitted_answers, (1, 0))
+
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call-3",
+                            "output": "{\"answers\":{}}",
+                        },
+                    }
+                )
+                + "\n"
             )
-            for _ in range(80):
-                await asyncio.sleep(0.02)
-                if self.daemon._interactive_snapshot.prompt is None:
-                    break
 
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.assertTrue(changed)
+        self.daemon._refresh_interactive_snapshot()
         self.assertIsNone(self.daemon._interactive_snapshot.prompt)
         self.assertEqual(self.daemon._session.waiting_out, 0)
-        submit.assert_awaited_once()
+
+    async def test_interactive_router_failure_does_not_fall_back_when_router_connected(self):
+        sid = "bbbbbbbb-2222-3333-4444-555555555555"
+        path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"type": "turn_context", "payload": {"turn_id": "t1"}})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "request_user_input",
+                        "arguments": json.dumps(
+                            {
+                                "threadId": sid,
+                                "questions": [
+                                    {
+                                        "header": "Scope",
+                                        "id": "scope",
+                                        "question": "Which scope?",
+                                        "options": [
+                                            {"label": "Local", "description": "local only"},
+                                            {"label": "Global", "description": "all"},
+                                        ],
+                                    }
+                                ],
+                            }
+                        ),
+                        "call_id": "call-router-fail",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.daemon._session_file_offsets[str(path)] = 0
+        daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.daemon._refresh_interactive_snapshot()
+        self.daemon._ensure_background_tasks()
+        self.daemon._router.submit_ok = False
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines):
+                break
+
+        prompt_id = self.daemon._interactive_snapshot.prompt.id
+        with patch.object(self.daemon, "_submit_interactive_answers_via_app_server", return_value=True) as fallback:
+            await FakeBleTransport.instances[-1].deliver(
+                json.dumps({"cmd": "interactive_select", "id": prompt_id, "question_index": 0, "answer": 0}).encode() + b"\n"
+            )
+            await asyncio.sleep(0.1)
+
+        fallback.assert_not_awaited()
+        prompt = self.daemon._interactive_snapshot.prompt
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt.status, "input")
 
     async def test_background_rescan_updates_total_for_next_heartbeat(self):
         self._write_session_file("2026/05/09/one.jsonl")

@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import pwd
+import shutil
 import signal
 import time
 from datetime import datetime
@@ -51,6 +52,7 @@ from .protocol import (
     parse_interactive_selection,
     parse_permission_decision,
 )
+from .router_client import CodexRouterClient, build_user_input_response
 
 DEFAULT_PERMISSION_WAIT_SECONDS = 105.0  # < hook timeout (115s) in hooks.json
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 8.0    # short scan/connect window so the hook
@@ -66,6 +68,7 @@ DEFAULT_EVENT_RETRY_DELAY_SECONDS = 5.0
 DEFAULT_INTERACTIVE_SCAN_INTERVAL_SECONDS = 1.0
 DEFAULT_INTERACTIVE_IDLE_SCAN_INTERVAL_SECONDS = 5.0
 DEFAULT_INTERACTIVE_CONNECT_TIMEOUT_SECONDS = 8.0
+DEFAULT_INTERACTIVE_INITIAL_TAIL_BYTES = 65536
 SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
 
@@ -73,6 +76,9 @@ SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 class InteractiveCallState:
     prompt: InteractivePrompt
     kind: str
+    current_index: int = 0
+    answers: tuple[int | None, ...] = ()
+    awaiting_host_ack: bool = False
 
 
 @dataclass
@@ -370,6 +376,7 @@ class Daemon:
         self._interactive_snapshot = InteractiveSnapshot()
         self._interactive_event = asyncio.Event()
         self._interactive_task: asyncio.Task[None] | None = None
+        self._router = CodexRouterClient(self._log)
 
     async def run(self) -> None:
         self._server = await ipc.serve(self.config.socket_path, self._handle_event)
@@ -412,6 +419,7 @@ class Daemon:
                 await self._interactive_task
             except asyncio.CancelledError:
                 pass
+        await self._router.stop()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -676,6 +684,7 @@ class Daemon:
                 self._interactive_loop(),
                 name="codex-buddy-interactive",
             )
+        self._router.start()
 
     def _request_state_sync(self) -> None:
         self._event_retry_deadline_monotonic = max(
@@ -938,13 +947,13 @@ class Daemon:
                                 task.cancel()
                     if selection_future in done:
                         selection = selection_future.result()
+                        selection_future = asyncio.get_running_loop().create_future()
                         if selection.id != snapshot.prompt.id:
-                            selection_future = asyncio.get_running_loop().create_future()
                             continue
-                        success = await self._submit_interactive_selection(snapshot.prompt, selection)
-                        if success:
-                            self._clear_interactive_prompt(snapshot.prompt.call_id, optimistic=True)
-                        return
+                        await self._apply_interactive_selection(snapshot.prompt.call_id, selection)
+                        if self._interactive_snapshot.prompt is None:
+                            return
+                        continue
                     if self._stop_event.is_set():
                         return
                     if self._interactive_event.is_set():
@@ -966,36 +975,128 @@ class Daemon:
         if not selection_future.done():
             selection_future.set_result(selection)
 
-    async def _submit_interactive_selection(
+    async def _apply_interactive_selection(
         self,
-        prompt: InteractivePrompt,
+        call_id: str,
         selection: InteractiveSelection,
     ) -> bool:
-        if len(selection.answers) != len(prompt.questions):
+        state = self._interactive_calls.get(call_id)
+        if state is None:
+            return False
+        if selection.question_index != state.current_index:
             self._log.warning(
-                "Interactive selection answer count mismatch: prompt=%s expected=%d got=%d",
-                prompt.id,
-                len(prompt.questions),
-                len(selection.answers),
+                "Interactive selection out of sequence: prompt=%s expected_q=%d got_q=%d",
+                state.prompt.id,
+                state.current_index,
+                selection.question_index,
+            )
+            return False
+        if state.awaiting_host_ack:
+            self._log.debug(
+                "Interactive selection ignored while awaiting host ack: prompt=%s q=%d",
+                state.prompt.id,
+                selection.question_index,
+            )
+            return False
+        question = state.prompt.questions[state.current_index]
+        if selection.answer < 0 or selection.answer >= len(question.options):
+            self._log.warning(
+                "Interactive selection index out of range: prompt=%s question=%s idx=%d options=%d",
+                state.prompt.id,
+                question.id,
+                selection.answer,
+                len(question.options),
             )
             return False
 
-        result: dict[str, Any] = {"answers": {}}
-        for answer_idx, question in zip(selection.answers, prompt.questions, strict=True):
-            if answer_idx < 0 or answer_idx >= len(question.options):
-                self._log.warning(
-                    "Interactive selection index out of range: prompt=%s question=%s idx=%d options=%d",
-                    prompt.id,
-                    question.id,
-                    answer_idx,
-                    len(question.options),
-                )
-                return False
-            result["answers"][question.id] = {"answers": [question.options[answer_idx]]}
+        answers = list(state.answers or ())
+        if not answers:
+            answers = [None] * len(state.prompt.questions)
+        answers[state.current_index] = selection.answer
 
+        if state.current_index + 1 < len(state.prompt.questions):
+            self._interactive_calls[call_id] = InteractiveCallState(
+                prompt=state.prompt,
+                kind=state.kind,
+                current_index=state.current_index + 1,
+                answers=tuple(answers),
+                awaiting_host_ack=False,
+            )
+            self._log.debug(
+                "Interactive answer accepted: prompt=%s q=%d/%d -> advancing",
+                state.prompt.id,
+                state.current_index + 1,
+                len(state.prompt.questions),
+            )
+            self._refresh_interactive_snapshot()
+            return True
+
+        ok = await self._submit_interactive_answers(state, tuple(answers))
+        if ok:
+            self._interactive_calls[call_id] = InteractiveCallState(
+                prompt=state.prompt,
+                kind=state.kind,
+                current_index=state.current_index,
+                answers=tuple(answers),
+                awaiting_host_ack=True,
+            )
+            self._log.info(
+                "Interactive selection submitted; awaiting host confirmation: prompt=%s turn=%s",
+                state.prompt.id,
+                state.prompt.turn_id,
+            )
+            self._refresh_interactive_snapshot()
+        return ok
+
+    async def _submit_interactive_answers(
+        self,
+        state: InteractiveCallState,
+        answers: tuple[int | None, ...],
+    ) -> bool:
+        prompt = state.prompt
+        result = build_user_input_response(prompt, answers)
+        if result is None:
+            for answer_idx, question in zip(answers, prompt.questions, strict=True):
+                if answer_idx is None or answer_idx < 0 or answer_idx >= len(question.options):
+                    self._log.warning(
+                        "Interactive answer missing before submit: prompt=%s question=%s answer=%r",
+                        prompt.id,
+                        question.id,
+                        answer_idx,
+                    )
+                    return False
+
+        ok = await self._router.submit_user_input_response(prompt, answers)
+        if ok:
+            self._log.info(
+                "Interactive selection submitted via IPC router: prompt=%s turn=%s",
+                prompt.id,
+                prompt.turn_id,
+            )
+            return True
+
+        if self._router.is_connected:
+            self._log.warning(
+                "Interactive router submit failed while router is connected: prompt=%s turn=%s",
+                prompt.id,
+                prompt.turn_id,
+            )
+            return False
+
+        self._log.warning(
+            "IPC router unavailable; falling back to app-server injection for prompt=%s turn=%s",
+            prompt.id,
+            prompt.turn_id,
+        )
+        return await self._submit_interactive_answers_via_app_server(prompt, result)
+
+    async def _submit_interactive_answers_via_app_server(
+        self,
+        prompt: InteractivePrompt,
+        result: dict[str, Any],
+    ) -> bool:
         payload = {
-            "jsonrpc": "2.0",
-            "id": int(time.time() * 1000),
+            "id": f"bridge-inject-{int(time.time() * 1000)}",
             "method": "thread/inject_items",
             "params": {
                 "threadId": prompt.thread_id,
@@ -1010,41 +1111,134 @@ class Daemon:
         }
         ok = await self._send_app_server_request(payload)
         if ok:
-            self._log.info("Interactive selection submitted: prompt=%s turn=%s", prompt.id, prompt.turn_id)
+            self._log.info(
+                "Interactive selection submitted via app-server fallback: prompt=%s turn=%s",
+                prompt.id,
+                prompt.turn_id,
+            )
         return ok
 
     async def _send_app_server_request(self, payload: dict[str, Any]) -> bool:
+        codex_bin = _resolve_codex_executable()
+        if codex_bin is None:
+            self._log.warning("Unable to resolve codex executable for app-server request")
+            return False
+        cmd = [codex_bin, "app-server", "--analytics-default-enabled"]
         proc = await asyncio.create_subprocess_exec(
-            "codex",
-            "app-server",
-            "proxy",
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        request = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
-        stdout, stderr = await proc.communicate(request)
-        if proc.returncode != 0:
-            self._log.warning("app-server proxy failed (%s): %s", proc.returncode, stderr.decode("utf-8", "ignore").strip())
-            return False
-        text = stdout.decode("utf-8", "ignore").strip()
-        if not text:
-            return False
+        request_id = str(payload.get("id") or f"bridge-request-{int(time.time() * 1000)}")
+
+        async def write_message(message: dict[str, Any]) -> None:
+            assert proc.stdin is not None
+            line = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
+            proc.stdin.write(line)
+            await proc.stdin.drain()
+
+        async def read_response(match_id: str, timeout: float) -> dict[str, Any] | None:
+            assert proc.stdout is not None
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return None
+                if not raw:
+                    return None
+                text = raw.decode("utf-8", "ignore").strip()
+                if not text:
+                    continue
+                try:
+                    message = json.loads(text)
+                except json.JSONDecodeError:
+                    self._log.debug("Ignoring non-JSON app-server stdout: %r", text)
+                    continue
+                if message.get("id") == match_id:
+                    return message
+                self._log.debug(
+                    "Ignoring unrelated app-server message while waiting for %s: method=%s id=%s",
+                    match_id,
+                    message.get("method"),
+                    message.get("id"),
+                )
+
         try:
-            response = json.loads(text.splitlines()[-1])
-        except json.JSONDecodeError:
-            self._log.warning("Invalid app-server proxy response: %r", text)
-            return False
-        if response.get("error"):
-            self._log.warning("app-server proxy returned error: %s", response["error"])
-            return False
-        return "result" in response
+            init_payload = {
+                "id": "bridge-init",
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-buddy-bridge",
+                        "title": "Codex Buddy Bridge",
+                        "version": "0.0.0",
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+            await write_message(init_payload)
+            init_response = await read_response("bridge-init", timeout=10.0)
+            if init_response is None:
+                self._log.warning("Timed out waiting for app-server initialize response")
+                return False
+            if init_response.get("error"):
+                self._log.warning("app-server initialize returned error: %s", init_response["error"])
+                return False
+
+            request_payload = dict(payload)
+            request_payload.pop("jsonrpc", None)
+            request_payload["id"] = request_id
+            thread_id = request_payload.get("params", {}).get("threadId")
+            if isinstance(thread_id, str) and thread_id:
+                resume_payload = {
+                    "id": "bridge-resume",
+                    "method": "thread/resume",
+                    "params": {"threadId": thread_id},
+                }
+                await write_message(resume_payload)
+                resume_response = await read_response("bridge-resume", timeout=15.0)
+                if resume_response is None:
+                    self._log.warning("Timed out waiting for app-server thread/resume response: thread=%s", thread_id)
+                    return False
+                if resume_response.get("error"):
+                    self._log.warning("app-server thread/resume returned error for %s: %s", thread_id, resume_response["error"])
+                    return False
+
+            await write_message(request_payload)
+            response = await read_response(request_id, timeout=15.0)
+            if response is None:
+                self._log.warning("Timed out waiting for app-server response: method=%s id=%s", payload.get("method"), request_id)
+                return False
+            if response.get("error"):
+                self._log.warning("app-server returned error: %s", response["error"])
+                return False
+            return "result" in response
+        finally:
+            stderr_text = ""
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            if proc.stderr is not None:
+                stderr_bytes = await proc.stderr.read()
+                stderr_text = stderr_bytes.decode("utf-8", "ignore").strip()
+            if proc.returncode not in (0, None) and stderr_text:
+                self._log.debug("app-server stderr: %s", stderr_text)
 
     def _refresh_interactive_snapshot(self) -> None:
         latest = None
         if self._interactive_calls:
             latest = next(reversed(self._interactive_calls.items()))[1]
-        latest_prompt = latest.prompt if latest is not None else None
+        latest_prompt = _interactive_display_prompt(latest) if latest is not None else None
         current = self._interactive_snapshot.prompt
         if current == latest_prompt:
             return
@@ -1215,8 +1409,7 @@ def _scan_interactive_events_from_files(
             with open(fp, "r", encoding="utf-8", errors="ignore") as handle:
                 size = handle.seek(0, os.SEEK_END)
                 if fp not in offsets:
-                    offsets[fp] = size
-                    continue
+                    offsets[fp] = max(0, size - DEFAULT_INTERACTIVE_INITIAL_TAIL_BYTES)
                 offset = offsets.get(fp, 0)
                 if offset > size:
                     offset = 0
@@ -1292,7 +1485,12 @@ def _consume_interactive_event(
             )
             if previous_call_id and previous_call_id != call_id:
                 interactive_calls.pop(previous_call_id, None)
-            interactive_calls[call_id] = InteractiveCallState(prompt=prompt, kind=kind)
+            interactive_calls[call_id] = InteractiveCallState(
+                prompt=prompt,
+                kind=kind,
+                current_index=0,
+                answers=tuple([None] * len(prompt.questions)),
+            )
             did_change, kind = session_state.on_interactive_start(session_id, turn, kind)
             changed = True
             if did_change:
@@ -1314,7 +1512,7 @@ def _consume_interactive_event(
             did_change = session_state.on_interactive_end(state.prompt.session_id, state.prompt.turn_id)
             if did_change:
                 log.debug(
-                    "Interactive inferred end (function output): session=%s turn=%s call=%s waiting_out=%d",
+                    "Interactive host confirmation observed (function output): session=%s turn=%s call=%s waiting_out=%d",
                     state.prompt.session_id,
                     state.prompt.turn_id,
                     call_id,
@@ -1405,6 +1603,9 @@ def _interactive_prompt_from_payload(
         thread_id=thread_id,
         turn_id=turn_id,
         session_id=session_id,
+        status="input",
+        question_index=0,
+        question_total=len(questions),
         questions=tuple(questions),
     )
 
@@ -1427,10 +1628,46 @@ def _normalize_interactive_options(options_raw: Any) -> list[str]:
     return normalized
 
 
+def _interactive_display_prompt(state: InteractiveCallState) -> InteractivePrompt:
+    current_index = max(0, min(state.current_index, len(state.prompt.questions) - 1))
+    return InteractivePrompt(
+        id=state.prompt.id,
+        call_id=state.prompt.call_id,
+        thread_id=state.prompt.thread_id,
+        turn_id=state.prompt.turn_id,
+        session_id=state.prompt.session_id,
+        status="submitting" if state.awaiting_host_ack else "input",
+        question_index=current_index,
+        question_total=state.prompt.question_total or len(state.prompt.questions),
+        questions=(state.prompt.questions[current_index],),
+    )
+
+
 def _interactive_prompt_id(turn_id: str, call_id: str) -> str:
     turn_short = turn_id[-8:] if len(turn_id) > 8 else turn_id
     call_short = call_id[-8:] if len(call_id) > 8 else call_id
     return f"i-{turn_short}-{call_short}"[:31]
+
+
+def _resolve_codex_executable() -> str | None:
+    from_env = os.environ.get("CODEX_BIN")
+    if from_env:
+        candidate = Path(from_env).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+
+    discovered = shutil.which("codex")
+    if discovered:
+        return discovered
+
+    extension_bins = sorted(
+        Path.home().glob(".vscode/extensions/openai.chatgpt-*/bin/linux-x86_64/codex"),
+        reverse=True,
+    )
+    for candidate in extension_bins:
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def _session_id_from_path(path: str) -> str | None:
