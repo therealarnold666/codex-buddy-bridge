@@ -48,11 +48,13 @@ DEFAULT_PERMISSION_WAIT_SECONDS = 105.0  # < hook timeout (115s) in hooks.json
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 8.0    # short scan/connect window so the hook
                                          # can give up quickly if Claude has the buddy
 DEFAULT_STATE_SYNC_INTERVAL_SECONDS = 12.0
-DEFAULT_IDLE_STATE_SYNC_INTERVAL_SECONDS = 60.0
+DEFAULT_IDLE_STATE_SYNC_INTERVAL_SECONDS = 180.0
 DEFAULT_STATE_SYNC_CONNECT_TIMEOUT_SECONDS = 3.0
 DEFAULT_SESSION_RESCAN_INTERVAL_SECONDS = 60.0
 DEFAULT_SESSION_SCAN_PATH = os.path.expanduser("~/.codex/sessions")
 DEFAULT_TOKEN_LEDGER_PATH = os.path.expanduser("~/.local/state/codex-buddy/token-ledger.json")
+DEFAULT_EVENT_RETRY_WINDOW_SECONDS = 20.0
+DEFAULT_EVENT_RETRY_DELAY_SECONDS = 5.0
 
 
 class SessionState:
@@ -204,6 +206,8 @@ class DaemonConfig:
     session_rescan_interval: float = DEFAULT_SESSION_RESCAN_INTERVAL_SECONDS
     session_scan_path: str = DEFAULT_SESSION_SCAN_PATH
     token_ledger_path: str = DEFAULT_TOKEN_LEDGER_PATH
+    event_retry_window: float = DEFAULT_EVENT_RETRY_WINDOW_SECONDS
+    event_retry_delay: float = DEFAULT_EVENT_RETRY_DELAY_SECONDS
 
 
 class TokenLedger:
@@ -279,6 +283,7 @@ class Daemon:
         self._state_sync_task: asyncio.Task[None] | None = None
         self._session_scan_task: asyncio.Task[None] | None = None
         self._last_state_sync_monotonic = 0.0
+        self._event_retry_deadline_monotonic = 0.0
         self._stop_event = asyncio.Event()
         self._log = logging.getLogger("codex-buddy.daemon")
 
@@ -530,6 +535,10 @@ class Daemon:
             )
 
     def _request_state_sync(self) -> None:
+        self._event_retry_deadline_monotonic = max(
+            self._event_retry_deadline_monotonic,
+            time.monotonic() + self.config.event_retry_window,
+        )
         self._state_sync_event.set()
 
     async def _session_scan_loop(self) -> None:
@@ -589,12 +598,32 @@ class Daemon:
                 break
 
             reason = "event" if triggered else "heartbeat"
-            await self._sync_state_once(reason)
+            success = await self._sync_state_once(reason)
+            self._last_state_sync_monotonic = loop.time()
 
-    async def _sync_state_once(self, reason: str) -> None:
+            if success:
+                self._event_retry_deadline_monotonic = 0.0
+                continue
+
+            if reason != "event":
+                continue
+
+            if loop.time() >= self._event_retry_deadline_monotonic:
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self.config.event_retry_delay,
+                )
+                break
+            except asyncio.TimeoutError:
+                self._state_sync_event.set()
+
+    async def _sync_state_once(self, reason: str) -> bool:
         if self._ble_lock.locked():
             self._log.debug("Skipping %s state sync while BLE is busy", reason)
-            return
+            return False
 
         sent_pending_tokens = self._session.pending_tokens
         async with self._ble_lock:
@@ -609,10 +638,10 @@ class Daemon:
                 )
             except asyncio.TimeoutError:
                 self._log.debug("State sync (%s) BLE connect timed out", reason)
-                return
+                return False
             except Exception as exc:  # noqa: BLE001
                 self._log.debug("State sync (%s) BLE connect failed: %s", reason, exc)
-                return
+                return False
 
             try:
                 await self._send_greeting(transport)
@@ -636,6 +665,7 @@ class Daemon:
                 )
                 if sent_pending_tokens > 0:
                     self._session.clear_pending_tokens()
+                return True
             finally:
                 try:
                     await transport.close()
