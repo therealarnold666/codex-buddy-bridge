@@ -10,6 +10,13 @@
 
 > 🌏 **English**: [README.en.md](README.en.md)
 
+## 关联项目
+
+- 固件项目：[`therealarnold666/claude-desktop-buddy-s3`](https://github.com/therealarnold666/claude-desktop-buddy-s3)
+- 本仓库负责 host 侧 daemon / hooks / BLE 状态同步与审批桥接。
+- 固件仓库负责 StickS3 端 UI、动画、功耗策略与 BLE 外设实现。
+- 两者通过同一套 BLE NUS + JSON 协议协作：bridge 下发状态，固件渲染与交互。
+
 ## 相对上游 fork 的改动
 
 本仓库在上游 `Yamiqu/codex-buddy-bridge` 基础上，增加了以下能力：

@@ -12,6 +12,13 @@ instead of clicking through prompts in the app.
 
 > 🌏 **中文版**: [README.md](README.md)
 
+## Related Repository
+
+- Firmware repo: [`therealarnold666/claude-desktop-buddy-s3`](https://github.com/therealarnold666/claude-desktop-buddy-s3)
+- This repo owns host-side daemon/hooks/BLE approval bridging.
+- The firmware repo owns StickS3 UI, animation, power policy, and BLE peripheral behavior.
+- They work together over the same BLE NUS + JSON protocol: bridge pushes state, firmware renders and handles button interaction.
+
 ## Delta From Upstream Fork
 
 Compared with upstream `Yamiqu/codex-buddy-bridge`, this repo adds:
