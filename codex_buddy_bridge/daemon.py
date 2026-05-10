@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import pwd
 import signal
 import time
@@ -55,6 +56,9 @@ DEFAULT_SESSION_SCAN_PATH = os.path.expanduser("~/.codex/sessions")
 DEFAULT_TOKEN_LEDGER_PATH = os.path.expanduser("~/.local/state/codex-buddy/token-ledger.json")
 DEFAULT_EVENT_RETRY_WINDOW_SECONDS = 20.0
 DEFAULT_EVENT_RETRY_DELAY_SECONDS = 5.0
+DEFAULT_INTERACTIVE_SCAN_INTERVAL_SECONDS = 1.0
+DEFAULT_INTERACTIVE_IDLE_SCAN_INTERVAL_SECONDS = 5.0
+SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
 
 class SessionState:
@@ -70,6 +74,9 @@ class SessionState:
         "_anonymous_running",
         "_session_turn_ids",
         "_turn_session_ids",
+        "_interactive_waiting",
+        "_interactive_waiting_keys",
+        "_interactive_waiting_kind",
         "pending_tokens",
         "total_tokens",
         "today_tokens",
@@ -87,6 +94,9 @@ class SessionState:
         self._session_turn_ids: dict[str, str] = {}
         self._turn_session_ids: dict[str, str] = {}
         self._anonymous_running = 0
+        self._interactive_waiting = 0
+        self._interactive_waiting_keys: set[str] = set()
+        self._interactive_waiting_kind: dict[str, str] = {}
 
     def on_session_start(self, source: str) -> None:
         if source == "clear":
@@ -94,6 +104,9 @@ class SessionState:
             self._session_turn_ids.clear()
             self._turn_session_ids.clear()
             self._anonymous_running = 0
+            self._interactive_waiting = 0
+            self._interactive_waiting_keys.clear()
+            self._interactive_waiting_kind.clear()
 
     def set_total(self, total: int) -> bool:
         total = max(0, total)
@@ -160,6 +173,32 @@ class SessionState:
         if self.waiting > 0:
             self.waiting -= 1
 
+    def on_interactive_start(
+        self,
+        session_id: str | None,
+        turn_id: str | None,
+        kind: str | None,
+    ) -> tuple[bool, str]:
+        key = _interactive_key(session_id, turn_id)
+        normalized_kind = _normalize_interactive_kind(kind)
+        if key in self._interactive_waiting_keys:
+            self._interactive_waiting_kind[key] = normalized_kind
+            return False, normalized_kind
+        self._interactive_waiting_keys.add(key)
+        self._interactive_waiting_kind[key] = normalized_kind
+        self._interactive_waiting += 1
+        return True, normalized_kind
+
+    def on_interactive_end(self, session_id: str | None, turn_id: str | None) -> bool:
+        key = _interactive_key(session_id, turn_id)
+        if key not in self._interactive_waiting_keys:
+            return False
+        self._interactive_waiting_keys.discard(key)
+        self._interactive_waiting_kind.pop(key, None)
+        if self._interactive_waiting > 0:
+            self._interactive_waiting -= 1
+        return True
+
     def on_stop(self, session_id: str | None, turn_id: str | None) -> bool:
         if turn_id:
             mapped_session_id = self._turn_session_ids.pop(turn_id, None)
@@ -189,8 +228,24 @@ class SessionState:
         return len(self._active_turn_ids) + self._anonymous_running
 
     @property
+    def interactive_waiting(self) -> int:
+        return self._interactive_waiting
+
+    @property
+    def waiting_out(self) -> int:
+        return self.waiting + self._interactive_waiting
+
+    @property
+    def interactive_message(self) -> str:
+        if not self._interactive_waiting_kind:
+            return "input needed"
+        if any(kind == "choice" for kind in self._interactive_waiting_kind.values()):
+            return "choice needed"
+        return "input needed"
+
+    @property
     def is_idle(self) -> bool:
-        return self.running == 0 and self.waiting == 0
+        return self.running == 0 and self.waiting_out == 0
 
 
 @dataclass
@@ -208,6 +263,8 @@ class DaemonConfig:
     token_ledger_path: str = DEFAULT_TOKEN_LEDGER_PATH
     event_retry_window: float = DEFAULT_EVENT_RETRY_WINDOW_SECONDS
     event_retry_delay: float = DEFAULT_EVENT_RETRY_DELAY_SECONDS
+    interactive_scan_interval: float = DEFAULT_INTERACTIVE_SCAN_INTERVAL_SECONDS
+    interactive_idle_scan_interval: float = DEFAULT_INTERACTIVE_IDLE_SCAN_INTERVAL_SECONDS
 
 
 class TokenLedger:
@@ -286,6 +343,9 @@ class Daemon:
         self._event_retry_deadline_monotonic = 0.0
         self._stop_event = asyncio.Event()
         self._log = logging.getLogger("codex-buddy.daemon")
+        self._session_file_offsets: dict[str, int] = {}
+        self._session_turn_by_file: dict[str, str] = {}
+        self._interactive_calls: dict[str, tuple[str, str | None]] = {}
 
     async def run(self) -> None:
         self._server = await ipc.serve(self.config.socket_path, self._handle_event)
@@ -361,13 +421,49 @@ class Daemon:
             turn_id = _string_or_none(body.get("turn_id"))
             if self._session.on_user_prompt_submit(session_id, turn_id):
                 self._log.debug(
-                    "Turn started: session=%s turn=%s running=%d",
+                    "Turn started: session=%s turn=%s running=%d waiting_out=%d",
                     session_id,
                     turn_id,
                     self._session.running,
+                    self._session.waiting_out,
                 )
                 self._request_state_sync()
             return None
+
+        if event == "interactive_start":
+            self._ensure_background_tasks()
+            session_id = _string_or_none(body.get("session_id"))
+            turn_id = _string_or_none(body.get("turn_id"))
+            kind = _string_or_none(body.get("kind"))
+            changed, resolved_kind = self._session.on_interactive_start(session_id, turn_id, kind)
+            msg = _interactive_message(resolved_kind)
+            self._log.debug(
+                "Interactive wait start: session=%s turn=%s kind=%s waiting_out=%d running=%d changed=%s",
+                session_id,
+                turn_id,
+                resolved_kind,
+                self._session.waiting_out,
+                self._session.running,
+                changed,
+            )
+            self._request_state_sync()
+            return {"ok": True, "waiting": self._session.waiting_out, "msg": msg}
+
+        if event == "interactive_end":
+            self._ensure_background_tasks()
+            session_id = _string_or_none(body.get("session_id"))
+            turn_id = _string_or_none(body.get("turn_id"))
+            changed = self._session.on_interactive_end(session_id, turn_id)
+            self._log.debug(
+                "Interactive wait end: session=%s turn=%s waiting_out=%d running=%d changed=%s",
+                session_id,
+                turn_id,
+                self._session.waiting_out,
+                self._session.running,
+                changed,
+            )
+            self._request_state_sync()
+            return {"ok": True, "waiting": self._session.waiting_out}
 
         if event == "stop":
             self._ensure_background_tasks()
@@ -378,7 +474,7 @@ class Daemon:
                 self._session.add_pending_tokens(token_delta, self._token_ledger.today_tokens())
             if self._session.on_stop(session_id, turn_id):
                 self._log.debug(
-                    "Turn stopped: session=%s turn=%s total=%d delta_tokens=%d host_tokens=%d tokens_today=%d running=%d",
+                    "Turn stopped: session=%s turn=%s total=%d delta_tokens=%d host_tokens=%d tokens_today=%d running=%d waiting_out=%d",
                     session_id,
                     turn_id,
                     self._session.total,
@@ -386,6 +482,7 @@ class Daemon:
                     self._session.total_tokens,
                     self._session.today_tokens,
                     self._session.running,
+                    self._session.waiting_out,
                 )
                 self._request_state_sync()
             elif token_delta:
@@ -437,15 +534,16 @@ class Daemon:
             self._session.on_waiting()
             await transport.write_line(build_session_state_snapshot(
                 running=self._session.running,
-                waiting=self._session.waiting,
+                waiting=self._session.waiting_out,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
                 tokens_today=self._session.today_tokens,
+                msg=self._state_msg(),
             ))
             await transport.write_line(build_prompt_snapshot(
                 request,
                 running=self._session.running,
-                waiting=self._session.waiting,
+                waiting=self._session.waiting_out,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
                 tokens_today=self._session.today_tokens,
@@ -458,7 +556,7 @@ class Daemon:
                 self._session.total_tokens,
                 self._session.today_tokens,
                 self._session.running,
-                self._session.waiting,
+                self._session.waiting_out,
             )
             try:
                 decision = await asyncio.wait_for(decision_future, timeout=self.config.permission_wait)
@@ -467,19 +565,21 @@ class Daemon:
                 self._session.on_approved()
                 await transport.write_line(build_session_state_snapshot(
                     running=self._session.running,
-                    waiting=self._session.waiting,
+                    waiting=self._session.waiting_out,
                     total=self._session.total,
                     tokens=self._session.pending_tokens,
                     tokens_today=self._session.today_tokens,
+                    msg=self._state_msg(),
                 ))
                 return {"decision": "timeout"}
             self._session.on_approved()
             await transport.write_line(build_session_state_snapshot(
                 running=self._session.running,
-                waiting=self._session.waiting,
+                waiting=self._session.waiting_out,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
                 tokens_today=self._session.today_tokens,
+                msg=self._state_msg(),
             ))
             # Final clear if no more sessions active
             if self._session.is_idle:
@@ -544,10 +644,17 @@ class Daemon:
     async def _session_scan_loop(self) -> None:
         await self._rescan_session_total(trigger_sync=True)
         while not self._stop_event.is_set():
+            await self._scan_interactive_from_sessions()
             try:
+                interval = (
+                    self.config.interactive_scan_interval
+                    if self._session.running > 0
+                    else self.config.interactive_idle_scan_interval
+                )
+                timeout = min(self.config.session_rescan_interval, interval)
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=self.config.session_rescan_interval,
+                    timeout=timeout,
                 )
                 break
             except asyncio.TimeoutError:
@@ -561,6 +668,19 @@ class Daemon:
             self._log.debug("Session total refreshed from disk: total=%d", total)
             if trigger_sync:
                 self._request_state_sync()
+
+    async def _scan_interactive_from_sessions(self) -> None:
+        changed = await asyncio.to_thread(
+            _scan_interactive_events_from_files,
+            self.config.session_scan_path,
+            self._session_file_offsets,
+            self._session_turn_by_file,
+            self._interactive_calls,
+            self._session,
+            self._log,
+        )
+        if changed:
+            self._request_state_sync()
 
     async def _collect_stop_token_delta(self, session_id: str | None) -> int:
         if not session_id:
@@ -647,10 +767,11 @@ class Daemon:
                 await self._send_greeting(transport)
                 await transport.write_line(build_session_state_snapshot(
                     running=self._session.running,
-                    waiting=self._session.waiting,
+                    waiting=self._session.waiting_out,
                     total=self._session.total,
                     tokens=self._session.pending_tokens,
                     tokens_today=self._session.today_tokens,
+                    msg=self._state_msg(),
                 ))
                 self._last_state_sync_monotonic = asyncio.get_running_loop().time()
                 self._log.debug(
@@ -661,7 +782,7 @@ class Daemon:
                     self._session.total_tokens,
                     self._session.today_tokens,
                     self._session.running,
-                    self._session.waiting,
+                    self._session.waiting_out,
                 )
                 if sent_pending_tokens > 0:
                     self._session.clear_pending_tokens()
@@ -671,6 +792,13 @@ class Daemon:
                     await transport.close()
                 except Exception as exc:  # noqa: BLE001
                     self._log.debug("State sync close() raised: %s", exc)
+
+    def _state_msg(self) -> str:
+        if self._session.waiting > 0:
+            return "approve: tool"
+        if self._session.interactive_waiting > 0:
+            return self._session.interactive_message
+        return "Codex running" if self._session.running else "Codex idle"
 
 
 def _request_from_payload(body: dict[str, Any]) -> ApprovalRequest:
@@ -720,6 +848,26 @@ def _string_or_none(value: Any) -> str | None:
     return None
 
 
+def _normalize_interactive_kind(kind: str | None) -> str:
+    if kind == "choice":
+        return "choice"
+    return "input"
+
+
+def _interactive_message(kind: str) -> str:
+    if kind == "choice":
+        return "choice needed"
+    return "input needed"
+
+
+def _interactive_key(session_id: str | None, turn_id: str | None) -> str:
+    if turn_id:
+        return f"turn:{turn_id}"
+    if session_id:
+        return f"session:{session_id}"
+    return "anon"
+
+
 def _count_session_files(scan_path: str) -> int:
     root = Path(scan_path).expanduser()
     if not root.exists():
@@ -761,6 +909,164 @@ def _find_session_file(scan_path: str, session_id: str) -> Path | None:
         return None
     matches = sorted(root.rglob(f"*{session_id}*.jsonl"))
     return matches[-1] if matches else None
+
+
+def _scan_interactive_events_from_files(
+    scan_path: str,
+    offsets: dict[str, int],
+    turn_by_file: dict[str, str],
+    interactive_calls: dict[str, tuple[str, str | None]],
+    session_state: SessionState,
+    log: logging.Logger,
+) -> bool:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return False
+    changed = False
+    files = [str(path) for path in root.rglob("*.jsonl") if path.is_file()]
+    known = set(offsets.keys())
+    current = set(files)
+    for removed in known - current:
+        offsets.pop(removed, None)
+        turn_by_file.pop(removed, None)
+    for fp in files:
+        session_id = _session_id_from_path(fp)
+        if session_id is None:
+            continue
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                if fp not in offsets:
+                    offsets[fp] = size
+                    continue
+                offset = offsets.get(fp, 0)
+                if offset > size:
+                    offset = 0
+                handle.seek(offset)
+                for raw in handle:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if _consume_interactive_event(
+                        obj,
+                        session_id,
+                        fp,
+                        turn_by_file,
+                        interactive_calls,
+                        session_state,
+                        log,
+                    ):
+                        changed = True
+                offsets[fp] = handle.tell()
+        except OSError:
+            continue
+    return changed
+
+
+def _consume_interactive_event(
+    obj: dict[str, Any],
+    session_id: str,
+    file_path: str,
+    turn_by_file: dict[str, str],
+    interactive_calls: dict[str, tuple[str, str | None]],
+    session_state: SessionState,
+    log: logging.Logger,
+) -> bool:
+    changed = False
+    entry_type = obj.get("type")
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    payload_type = payload.get("type")
+
+    turn_id = _string_or_none(payload.get("turn_id"))
+    if turn_id and payload_type in {"task_started", "turn_started"}:
+        previous = turn_by_file.get(file_path)
+        if previous and previous != turn_id:
+            changed = _end_interactive_for_turn(previous, interactive_calls, session_state, log) or changed
+        turn_by_file[file_path] = turn_id
+    elif entry_type == "turn_context" and turn_id:
+        previous = turn_by_file.get(file_path)
+        if previous and previous != turn_id:
+            changed = _end_interactive_for_turn(previous, interactive_calls, session_state, log) or changed
+        turn_by_file[file_path] = turn_id
+
+    if entry_type == "response_item" and payload_type == "function_call":
+        name = payload.get("name")
+        call_id = _string_or_none(payload.get("call_id"))
+        if name == "request_user_input" and call_id:
+            turn = turn_by_file.get(file_path)
+            interactive_calls[call_id] = (session_id, turn)
+            did_change, kind = session_state.on_interactive_start(session_id, turn, "input")
+            if did_change:
+                log.debug(
+                    "Interactive inferred start: session=%s turn=%s call=%s kind=%s waiting_out=%d",
+                    session_id,
+                    turn,
+                    call_id,
+                    kind,
+                    session_state.waiting_out,
+                )
+                changed = True
+
+    if entry_type == "response_item" and payload_type == "function_call_output":
+        call_id = _string_or_none(payload.get("call_id"))
+        if call_id and call_id in interactive_calls:
+            sess, turn = interactive_calls.pop(call_id)
+            did_change = session_state.on_interactive_end(sess, turn)
+            if did_change:
+                log.debug(
+                    "Interactive inferred end (function output): session=%s turn=%s call=%s waiting_out=%d",
+                    sess,
+                    turn,
+                    call_id,
+                    session_state.waiting_out,
+                )
+                changed = True
+
+    if entry_type == "event_msg" and payload_type in {"turn_aborted", "task_complete", "turn_completed"}:
+        if turn_id:
+            changed = _end_interactive_for_turn(turn_id, interactive_calls, session_state, log) or changed
+
+    if entry_type == "response_item" and payload_type == "message" and payload.get("role") == "user":
+        active_turn = turn_by_file.get(file_path)
+        if active_turn:
+            changed = _end_interactive_for_turn(active_turn, interactive_calls, session_state, log) or changed
+
+    return changed
+
+
+def _end_interactive_for_turn(
+    turn_id: str,
+    interactive_calls: dict[str, tuple[str, str | None]],
+    session_state: SessionState,
+    log: logging.Logger,
+) -> bool:
+    changed = False
+    matched_calls = [call_id for call_id, (_sid, tid) in interactive_calls.items() if tid == turn_id]
+    for call_id in matched_calls:
+        sid, tid = interactive_calls.pop(call_id)
+        if session_state.on_interactive_end(sid, tid):
+            log.debug(
+                "Interactive inferred end (turn finished): session=%s turn=%s call=%s waiting_out=%d",
+                sid,
+                tid,
+                call_id,
+                session_state.waiting_out,
+            )
+            changed = True
+    return changed
+
+
+def _session_id_from_path(path: str) -> str | None:
+    m = SESSION_ID_RE.search(path)
+    if not m:
+        return None
+    return m.group(1)
 
 
 def _local_today_key() -> str:

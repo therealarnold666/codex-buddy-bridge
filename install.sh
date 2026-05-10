@@ -6,7 +6,7 @@
 #   2. Renders the launchd plist with absolute paths and loads it.
 #   3. Enables [features] codex_hooks = true in ~/.codex/config.toml.
 #   4. Writes ~/.codex/hooks.json with PermissionRequest + SessionStart +
-#      UserPromptSubmit + Stop
+#      UserPromptSubmit + InteractiveStart + InteractiveEnd + Stop
 #      entries pointing at hooks/*.py. Existing hooks.json is backed up.
 #
 # Re-running this script is idempotent.
@@ -83,10 +83,14 @@ PERM_HOOK="${BRIDGE_ROOT}/hooks/permission_request.py"
 SESSION_HOOK="${BRIDGE_ROOT}/hooks/session_start.py"
 PROMPT_HOOK="${BRIDGE_ROOT}/hooks/user_prompt_submit.py"
 STOP_HOOK="${BRIDGE_ROOT}/hooks/stop.py"
+INTERACTIVE_START_HOOK="${BRIDGE_ROOT}/hooks/interactive_start.py"
+INTERACTIVE_END_HOOK="${BRIDGE_ROOT}/hooks/interactive_end.py"
 chmod +x "${PERM_HOOK}"
 chmod +x "${SESSION_HOOK}"
 chmod +x "${PROMPT_HOOK}"
 chmod +x "${STOP_HOOK}"
+chmod +x "${INTERACTIVE_START_HOOK}"
+chmod +x "${INTERACTIVE_END_HOOK}"
 
 if [[ -f "${HOOKS_JSON}" ]]; then
     cp "${HOOKS_JSON}" "${HOOKS_JSON}.bak.$(date +%s)"
@@ -140,6 +144,30 @@ cat > "${HOOKS_JSON}" <<EOF
           {
             "type": "command",
             "command": "${STOP_HOOK}",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "InteractiveStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${INTERACTIVE_START_HOOK}",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "InteractiveEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${INTERACTIVE_END_HOOK}",
             "timeout": 3
           }
         ]

@@ -23,6 +23,10 @@
 
 - Hook 覆盖面从 `PermissionRequest` 扩展到
   `SessionStart + UserPromptSubmit + Stop`，并在 daemon 内做 turn 级运行态管理。
+- 增加 `interactive_waiting` 状态线：
+  - 从 session JSONL 增量解析 `request_user_input` 自动推断开始/结束
+  - 与 approval waiting 聚合输出到同一 `waiting` 计数（保持 BLE 协议兼容）
+  - `msg` 区分来源（`approve:*` / `input needed` / `choice needed`）
 - `running` 改为按 turn 统计，支持同 session 内连续对话，不再只靠新建 session。
 - `sessions` 改为扫描 `~/.codex/sessions/**/*.jsonl` 的真实数量，并周期性重扫。
 - token 统计改为“每轮 Stop 时按 session 文件计算增量”，并维护 host 端账本：
@@ -32,6 +36,15 @@
 - 状态同步增加事件重试窗口，降低 BLE 占空时漏帧导致的 busy 卡住问题。
 - CLI 新增 `codex-buddy pair`（Linux）：
   通过 `bluetoothctl` 执行 `pair/trust/connect`。
+
+## Interactive Waiting 说明
+
+- 当前 Codex 稳定 hooks 只包含：
+  `PermissionRequest / SessionStart / UserPromptSubmit / Stop`。
+- 因此 interactive 问答不是靠额外 hook 事件，而是 daemon 从
+  `~/.codex/sessions/**/*.jsonl` 增量解析 `request_user_input` 与其结束信号推断。
+- 推断到 interactive 后，bridge 会下发 waiting 状态并触发 stick 的 attention 提醒；
+  结束后自动恢复 busy 或 idle。
 
 ## 工作原理
 

@@ -73,7 +73,9 @@ def build_session_state_snapshot(
     total: int = 0,
     tokens: int = 0,
     tokens_today: int = 0,
+    msg: str | None = None,
 ) -> str:
+    state_msg = msg if msg is not None else ("Codex running" if running else "Codex idle")
     return _encode_line(
         {
             "total": total,
@@ -82,7 +84,7 @@ def build_session_state_snapshot(
             "tokens": tokens,
             "tokens_today": tokens_today,
             "completed": False,
-            "msg": "Codex running" if running else "Codex idle",
+            "msg": state_msg,
         }
     )
 

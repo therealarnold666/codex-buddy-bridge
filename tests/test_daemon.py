@@ -400,6 +400,174 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertEqual(snapshot["running"], 0)
         self.assertEqual(snapshot["msg"], "Codex idle")
 
+    async def test_interactive_waiting_round_trip_restores_busy_when_running(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "interactive_start", "payload": {"session_id": "s1", "turn_id": "t1", "kind": "input"}},
+        )
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+        self.assertEqual(snapshot["waiting"], 1)
+        self.assertEqual(snapshot["msg"], "input needed")
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "interactive_end", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                latest = json.loads(FakeBleTransport.instances[-1].lines[-1])
+                if latest["waiting"] == 0:
+                    snapshot = latest
+                    break
+        self.assertEqual(snapshot["running"], 1)
+        self.assertEqual(snapshot["waiting"], 0)
+        self.assertEqual(snapshot["msg"], "Codex running")
+
+    async def test_interactive_and_permission_waiting_counts_stack(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "interactive_start", "payload": {"session_id": "s1", "turn_id": "t1", "kind": "choice"}},
+        )
+        await asyncio.sleep(0.05)
+        self.daemon._session.on_waiting()
+        self.daemon._request_state_sync()
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["waiting"], 2)
+        self.assertEqual(snapshot["msg"], "approve: tool")
+
+    async def test_interactive_end_is_idempotent_and_does_not_underflow(self):
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "interactive_start", "payload": {"session_id": "s1", "turn_id": "t1", "kind": "input"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "interactive_end", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "interactive_end", "payload": {"session_id": "s1", "turn_id": "t1"}},
+        )
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_interactive_inferred_from_request_user_input_and_function_output(self):
+        sid = "11111111-2222-3333-4444-555555555555"
+        path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "turn_context", "payload": {"turn_id": "t1"}}),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "name": "request_user_input",
+                                "call_id": "call-1",
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.daemon._session_file_offsets[str(path)] = 0
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(self.daemon._session.waiting_out, 1)
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {"type": "function_call_output", "call_id": "call-1", "output": "{}"},
+                    }
+                )
+                + "\n"
+            )
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(self.daemon._session.waiting_out, 0)
+
+    async def test_interactive_inferred_end_on_turn_aborted(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "turn_context", "payload": {"turn_id": "t1"}}),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "name": "request_user_input",
+                                "call_id": "call-2",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "t1"}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.daemon._session_file_offsets[str(path)] = 0
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(self.daemon._session.waiting_out, 0)
+
     async def test_background_rescan_updates_total_for_next_heartbeat(self):
         self._write_session_file("2026/05/09/one.jsonl")
         self.daemon.config.state_sync_interval = 0.05
@@ -427,12 +595,14 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(120):
             await asyncio.sleep(0.02)
-            if len(FakeBleTransport.instances) >= 2:
-                latest = json.loads(FakeBleTransport.instances[-1].lines[-1])
+            with_lines = [t for t in FakeBleTransport.instances if t.lines]
+            if len(with_lines) >= 2:
+                latest = json.loads(with_lines[-1].lines[-1])
                 if latest["total"] == 0:
                     break
 
-        latest = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        with_lines = [t for t in FakeBleTransport.instances if t.lines]
+        latest = json.loads(with_lines[-1].lines[-1])
         self.assertEqual(latest["running"], 1)
         self.assertEqual(latest["total"], 0)
         self.assertEqual(latest["tokens"], 0)
