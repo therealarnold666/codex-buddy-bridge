@@ -3,12 +3,16 @@ import unittest
 
 from codex_buddy_bridge.protocol import (
     ApprovalRequest,
+    InteractivePrompt,
+    InteractiveQuestion,
     PermissionDecision,
     build_clear_snapshot,
     build_owner_frame,
     build_prompt_snapshot,
+    build_session_state_snapshot,
     build_state_snapshot,
     build_time_frame,
+    parse_interactive_selection,
     parse_permission_decision,
     truncate_entry,
 )
@@ -78,6 +82,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(parse_permission_decision("not json"))
         self.assertIsNone(parse_permission_decision('{"cmd":"status"}'))
         self.assertIsNone(parse_permission_decision('{"cmd":"permission","id":"x","decision":"forever"}'))
+
+    def test_builds_interactive_snapshot(self):
+        prompt = InteractivePrompt(
+            id="i-1",
+            call_id="call-123",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            session_id="session-1",
+            questions=(
+                InteractiveQuestion(
+                    id="q1",
+                    header="Scope",
+                    question="What scope do you want?",
+                    options=("Local", "Global"),
+                ),
+            ),
+        )
+        data = json.loads(build_session_state_snapshot(running=1, waiting=1, total=1, interactive=prompt))
+        self.assertEqual(data["interactive"]["id"], "i-1")
+        self.assertEqual(data["interactive"]["call_id"], "call-123")
+        self.assertEqual(data["interactive"]["question_count"], 1)
+        self.assertEqual(data["interactive"]["questions"][0]["options"], ["Local", "Global"])
+
+    def test_parses_interactive_selection(self):
+        selection = parse_interactive_selection('{"cmd":"interactive_select","id":"i-1","answers":[1,0,2]}\n')
+        self.assertIsNotNone(selection)
+        self.assertEqual(selection.id, "i-1")
+        self.assertEqual(selection.answers, (1, 0, 2))
+
+    def test_ignores_invalid_interactive_selection(self):
+        self.assertIsNone(parse_interactive_selection('{"cmd":"interactive_select","id":"i-1","answers":["x"]}'))
 
     def test_truncate_entry_caps_long_text(self):
         line = truncate_entry("a" * 200)

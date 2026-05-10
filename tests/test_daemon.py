@@ -83,6 +83,12 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
                 await self.daemon._state_sync_task
             except asyncio.CancelledError:
                 pass
+        if self.daemon._interactive_task is not None:
+            self.daemon._interactive_task.cancel()
+            try:
+                await self.daemon._interactive_task
+            except asyncio.CancelledError:
+                pass
         self.server.close()
         await self.server.wait_closed()
         try:
@@ -490,6 +496,23 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
                             "payload": {
                                 "type": "function_call",
                                 "name": "request_user_input",
+                                "arguments": json.dumps(
+                                    {
+                                        "threadId": sid,
+                                        "questions": [
+                                            {
+                                                "header": "Scope",
+                                                "id": "scope",
+                                                "question": "Which scope?",
+                                                "options": [
+                                                    {"label": "Local", "description": "local only"},
+                                                    {"label": "Global", "description": "all"},
+                                                    {"label": "", "description": "other"},
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ),
                                 "call_id": "call-1",
                             },
                         }
@@ -510,6 +533,9 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         )
         self.assertTrue(changed)
         self.assertEqual(self.daemon._session.waiting_out, 1)
+        self.daemon._refresh_interactive_snapshot()
+        self.assertIsNotNone(self.daemon._interactive_snapshot.prompt)
+        self.assertEqual(self.daemon._interactive_snapshot.prompt.questions[0].options, ("Local", "Global"))
 
         with path.open("a", encoding="utf-8") as f:
             f.write(
@@ -546,6 +572,22 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
                             "payload": {
                                 "type": "function_call",
                                 "name": "request_user_input",
+                                "arguments": json.dumps(
+                                    {
+                                        "threadId": sid,
+                                        "questions": [
+                                            {
+                                                "header": "Mode",
+                                                "id": "mode",
+                                                "question": "Which mode?",
+                                                "options": [
+                                                    {"label": "Strict", "description": "strict"},
+                                                    {"label": "Loose", "description": "loose"},
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ),
                                 "call_id": "call-2",
                             },
                         }
@@ -567,6 +609,86 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         )
         self.assertTrue(changed)
         self.assertEqual(self.daemon._session.waiting_out, 0)
+
+    async def test_interactive_selection_submits_function_call_output(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"type": "turn_context", "payload": {"turn_id": "t1"}})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "request_user_input",
+                        "arguments": json.dumps(
+                            {
+                                "threadId": sid,
+                                "questions": [
+                                    {
+                                        "header": "Scope",
+                                        "id": "scope",
+                                        "question": "Which scope?",
+                                        "options": [
+                                            {"label": "Local", "description": "local only"},
+                                            {"label": "Global", "description": "all"},
+                                        ],
+                                    },
+                                    {
+                                        "header": "Mode",
+                                        "id": "mode",
+                                        "question": "Which mode?",
+                                        "options": [
+                                            {"label": "Fast", "description": "fast"},
+                                            {"label": "Safe", "description": "safe"},
+                                        ],
+                                    },
+                                ],
+                            }
+                        ),
+                        "call_id": "call-3",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.daemon._session_file_offsets[str(path)] = 0
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.assertTrue(changed)
+        self.daemon._refresh_interactive_snapshot()
+        self.daemon._ensure_background_tasks()
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines):
+                break
+
+        self.assertTrue(FakeBleTransport.instances)
+        self.assertTrue(any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines))
+        prompt_id = self.daemon._interactive_snapshot.prompt.id
+
+        with patch.object(self.daemon, "_send_app_server_request", return_value=True) as submit:
+            await FakeBleTransport.instances[-1].deliver(
+                json.dumps({"cmd": "interactive_select", "id": prompt_id, "answers": [1, 0]}).encode() + b"\n"
+            )
+            for _ in range(80):
+                await asyncio.sleep(0.02)
+                if self.daemon._interactive_snapshot.prompt is None:
+                    break
+
+        self.assertIsNone(self.daemon._interactive_snapshot.prompt)
+        self.assertEqual(self.daemon._session.waiting_out, 0)
+        submit.assert_awaited_once()
 
     async def test_background_rescan_updates_total_for_next_heartbeat(self):
         self._write_session_file("2026/05/09/one.jsonl")
