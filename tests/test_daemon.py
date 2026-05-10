@@ -685,7 +685,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertTrue(changed)
         self.assertEqual(self.daemon._session.waiting_out, 0)
 
-    async def test_interactive_selection_advances_then_submits_live_user_input(self):
+    async def test_interactive_waiting_pushes_state_without_detail_payload(self):
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -745,48 +745,17 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines):
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
                 break
 
         self.assertTrue(FakeBleTransport.instances)
-        self.assertTrue(any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines))
-        prompt_id = self.daemon._interactive_snapshot.prompt.id
+        self.assertFalse(any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines))
+        self.assertTrue(any('"waiting":1' in line for line in FakeBleTransport.instances[-1].lines))
+        self.assertTrue(any('"msg":"choice needed"' in line for line in FakeBleTransport.instances[-1].lines))
+        self.assertIsNone(self.daemon._interactive_task)
         self.assertEqual(self.daemon._interactive_snapshot.prompt.question_index, 0)
         self.assertEqual(self.daemon._interactive_snapshot.prompt.question_total, 2)
         self.assertEqual(self.daemon._interactive_snapshot.prompt.status, "input")
-
-        await FakeBleTransport.instances[-1].deliver(
-            json.dumps({"cmd": "interactive_select", "id": prompt_id, "question_index": 0, "answer": 1}).encode() + b"\n"
-        )
-        for _ in range(80):
-            await asyncio.sleep(0.02)
-            prompt = self.daemon._interactive_snapshot.prompt
-            if prompt is not None and prompt.question_index == 1:
-                break
-
-        prompt = self.daemon._interactive_snapshot.prompt
-        self.assertIsNotNone(prompt)
-        self.assertEqual(prompt.question_index, 1)
-        self.assertEqual(prompt.questions[0].id, "mode")
-        self.assertEqual(self.daemon._router.submissions, [])
-
-        await FakeBleTransport.instances[-1].deliver(
-            json.dumps({"cmd": "interactive_select", "id": prompt_id, "question_index": 1, "answer": 0}).encode() + b"\n"
-        )
-        for _ in range(80):
-            await asyncio.sleep(0.02)
-            prompt = self.daemon._interactive_snapshot.prompt
-            if prompt is not None and prompt.status == "submitting":
-                break
-
-        prompt = self.daemon._interactive_snapshot.prompt
-        self.assertIsNotNone(prompt)
-        self.assertEqual(prompt.status, "submitting")
-        self.assertEqual(self.daemon._session.waiting_out, 1)
-        self.assertEqual(len(self.daemon._router.submissions), 1)
-        submitted_prompt, submitted_answers = self.daemon._router.submissions[0]
-        self.assertEqual(submitted_prompt.call_id, "call-3")
-        self.assertEqual(submitted_answers, (1, 0))
 
         with path.open("a", encoding="utf-8") as fh:
             fh.write(
@@ -816,7 +785,7 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertIsNone(self.daemon._interactive_snapshot.prompt)
         self.assertEqual(self.daemon._session.waiting_out, 0)
 
-    async def test_interactive_router_failure_does_not_fall_back_when_router_connected(self):
+    async def test_interactive_does_not_start_router_submission_flow(self):
         sid = "bbbbbbbb-2222-3333-4444-555555555555"
         path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{sid}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -863,24 +832,14 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         )
         self.daemon._refresh_interactive_snapshot()
         self.daemon._ensure_background_tasks()
-        self.daemon._router.submit_ok = False
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines):
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
                 break
 
-        prompt_id = self.daemon._interactive_snapshot.prompt.id
-        with patch.object(self.daemon, "_submit_interactive_answers_via_app_server", return_value=True) as fallback:
-            await FakeBleTransport.instances[-1].deliver(
-                json.dumps({"cmd": "interactive_select", "id": prompt_id, "question_index": 0, "answer": 0}).encode() + b"\n"
-            )
-            await asyncio.sleep(0.1)
-
-        fallback.assert_not_awaited()
-        prompt = self.daemon._interactive_snapshot.prompt
-        self.assertIsNotNone(prompt)
-        self.assertEqual(prompt.status, "input")
+        self.assertIsNone(self.daemon._interactive_task)
+        self.assertEqual(self.daemon._router.submissions, [])
 
     async def test_background_rescan_updates_total_for_next_heartbeat(self):
         self._write_session_file("2026/05/09/one.jsonl")

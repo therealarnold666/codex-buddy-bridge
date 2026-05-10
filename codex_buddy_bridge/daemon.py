@@ -582,7 +582,6 @@ class Daemon:
                 tokens=self._session.pending_tokens,
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
-                interactive=self._interactive_snapshot.prompt,
             ))
             await transport.write_line(build_prompt_snapshot(
                 request,
@@ -614,7 +613,6 @@ class Daemon:
                     tokens=self._session.pending_tokens,
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
-                    interactive=self._interactive_snapshot.prompt,
                 ))
                 return {"decision": "timeout"}
             self._session.on_approved()
@@ -625,7 +623,6 @@ class Daemon:
                 tokens=self._session.pending_tokens,
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
-                interactive=self._interactive_snapshot.prompt,
             ))
             # Final clear if no more sessions active
             if self._session.is_idle:
@@ -679,12 +676,6 @@ class Daemon:
                 self._session_scan_loop(),
                 name="codex-buddy-session-scan",
             )
-        if self._interactive_task is None or self._interactive_task.done():
-            self._interactive_task = asyncio.create_task(
-                self._interactive_loop(),
-                name="codex-buddy-interactive",
-            )
-        self._router.start()
 
     def _request_state_sync(self) -> None:
         self._event_retry_deadline_monotonic = max(
@@ -825,7 +816,6 @@ class Daemon:
                     tokens=self._session.pending_tokens,
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
-                    interactive=self._interactive_snapshot.prompt,
                 ))
                 self._last_state_sync_monotonic = asyncio.get_running_loop().time()
                 self._log.debug(
