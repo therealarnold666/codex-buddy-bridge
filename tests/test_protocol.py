@@ -38,6 +38,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(data["running"], 0)
         self.assertEqual(data["waiting"], 1)
         self.assertEqual(data["tokens"], 0)
+        self.assertEqual(data["tokens_total"], 0)
         self.assertEqual(data["tokens_today"], 0)
         self.assertEqual(data["prompt"]["id"], "codex-1")
         self.assertEqual(data["prompt"]["tool"], "shell command that")
@@ -107,6 +108,7 @@ class ProtocolTests(unittest.TestCase):
             ),
         )
         data = json.loads(build_session_state_snapshot(running=1, waiting=1, total=1, interactive=prompt))
+        self.assertEqual(data["tokens_total"], 0)
         self.assertEqual(data["interactive"]["id"], "i-1")
         self.assertEqual(data["interactive"]["call_id"], "call-123")
         self.assertEqual(data["interactive"]["status"], "input")

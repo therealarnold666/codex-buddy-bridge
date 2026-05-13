@@ -594,6 +594,7 @@ class Daemon:
                 waiting=self._session.waiting_out,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
+                tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
             ))
@@ -603,6 +604,7 @@ class Daemon:
                 waiting=self._session.waiting_out,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
+                tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
             ))
             self._log.info(
@@ -625,6 +627,7 @@ class Daemon:
                     waiting=self._session.waiting_out,
                     total=self._session.total,
                     tokens=self._session.pending_tokens,
+                    tokens_total=self._session.total_tokens,
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
                 ))
@@ -635,6 +638,7 @@ class Daemon:
                 waiting=self._session.waiting_out,
                 total=self._session.total,
                 tokens=self._session.pending_tokens,
+                tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
             ))
@@ -837,6 +841,7 @@ class Daemon:
                     waiting=self._session.waiting_out,
                     total=self._session.total,
                     tokens=self._session.pending_tokens,
+                    tokens_total=self._session.total_tokens,
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
                 ))
@@ -925,6 +930,7 @@ class Daemon:
                                 waiting=self._session.waiting_out,
                                 total=self._session.total,
                                 tokens=self._session.pending_tokens,
+                                tokens_total=self._session.total_tokens,
                                 tokens_today=self._session.today_tokens,
                                 msg=self._state_msg(),
                             )
@@ -938,6 +944,7 @@ class Daemon:
                                 waiting=self._session.waiting_out,
                                 total=self._session.total,
                                 tokens=self._session.pending_tokens,
+                                tokens_total=self._session.total_tokens,
                                 tokens_today=self._session.today_tokens,
                                 msg=self._state_msg(),
                                 interactive=snapshot.prompt,

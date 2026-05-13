@@ -69,6 +69,7 @@ def build_prompt_snapshot(
     waiting: int = 1,
     total: int = 1,
     tokens: int = 0,
+    tokens_total: int = 0,
     tokens_today: int = 0,
 ) -> str:
     return _encode_line(
@@ -77,6 +78,7 @@ def build_prompt_snapshot(
             "running": running,
             "waiting": waiting,
             "tokens": tokens,
+            "tokens_total": tokens_total,
             "tokens_today": tokens_today,
             "msg": _truncate(f"approve: {approval.tool}", PROMPT_TOOL_LIMIT + 9),
             "prompt": {
@@ -105,6 +107,7 @@ def build_session_state_snapshot(
     waiting: int = 0,
     total: int = 0,
     tokens: int = 0,
+    tokens_total: int = 0,
     tokens_today: int = 0,
     msg: str | None = None,
     interactive: InteractivePrompt | None = None,
@@ -115,6 +118,7 @@ def build_session_state_snapshot(
         "running": running,
         "waiting": waiting,
         "tokens": tokens,
+        "tokens_total": tokens_total,
         "tokens_today": tokens_today,
         "completed": False,
         "msg": state_msg,
