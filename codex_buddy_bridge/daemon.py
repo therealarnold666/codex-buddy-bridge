@@ -141,6 +141,19 @@ class SessionState:
         self.total = total
         return True
 
+    def reconcile_sessions(self, removed_session_ids: set[str]) -> bool:
+        changed = False
+        for session_id in removed_session_ids:
+            turn_id = self._session_turn_ids.pop(session_id, None)
+            if turn_id:
+                self._turn_session_ids.pop(turn_id, None)
+                if turn_id in self._active_turn_ids:
+                    self._active_turn_ids.remove(turn_id)
+                    changed = True
+            if self.on_interactive_end(session_id, turn_id):
+                changed = True
+        return changed
+
     def set_total_tokens(self, tokens: int) -> bool:
         tokens = max(0, tokens)
         if self.total_tokens == tokens:
@@ -372,6 +385,7 @@ class Daemon:
         self._log = logging.getLogger("codex-buddy.daemon")
         self._session_file_offsets: dict[str, int] = {}
         self._session_turn_by_file: dict[str, str] = {}
+        self._known_session_ids: set[str] = set()
         self._interactive_calls: dict[str, InteractiveCallState] = {}
         self._interactive_snapshot = InteractiveSnapshot()
         self._interactive_event = asyncio.Event()
@@ -706,9 +720,18 @@ class Daemon:
 
     async def _rescan_session_total(self, trigger_sync: bool) -> None:
         total = await asyncio.to_thread(_count_session_files, self.config.session_scan_path)
+        session_ids = await asyncio.to_thread(_list_session_ids, self.config.session_scan_path)
         changed = self._session.set_total(total)
-        if changed:
-            self._log.debug("Session total refreshed from disk: total=%d", total)
+        removed_session_ids = self._known_session_ids - session_ids
+        reconciled = self._session.reconcile_sessions(removed_session_ids) if removed_session_ids else False
+        self._known_session_ids = session_ids
+        if changed or reconciled:
+            self._log.debug(
+                "Session total refreshed from disk: total=%d reconciled=%s running=%d",
+                total,
+                reconciled,
+                self._session.running,
+            )
             if trigger_sync:
                 self._request_state_sync()
 
@@ -1337,6 +1360,20 @@ def _count_session_files(scan_path: str) -> int:
     return sum(1 for path in root.rglob("*.jsonl") if path.is_file())
 
 
+def _list_session_ids(scan_path: str) -> set[str]:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return set()
+    session_ids: set[str] = set()
+    for path in root.rglob("*.jsonl"):
+        if not path.is_file():
+            continue
+        session_id = _session_id_from_path(str(path))
+        if session_id:
+            session_ids.add(session_id)
+    return session_ids
+
+
 def _scan_session_output_tokens(path: Path) -> int:
     best = 0
     try:
@@ -1512,6 +1549,16 @@ def _consume_interactive_event(
 
     if entry_type == "event_msg" and payload_type in {"turn_aborted", "task_complete", "turn_completed"}:
         if turn_id:
+            if session_state.on_stop(session_id, turn_id):
+                log.debug(
+                    "Turn inferred stop from session log: session=%s turn=%s reason=%s running=%d waiting_out=%d",
+                    session_id,
+                    turn_id,
+                    payload_type,
+                    session_state.running,
+                    session_state.waiting_out,
+                )
+                changed = True
             changed = _end_interactive_for_turn(turn_id, interactive_calls, session_state, log) or changed
 
     if entry_type == "response_item" and payload_type == "message" and payload.get("role") == "user":

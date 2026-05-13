@@ -255,6 +255,37 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertEqual(snapshot["running"], 0)
         self.assertEqual(snapshot["msg"], "Codex idle")
 
+    async def test_session_rescan_clears_running_turn_for_removed_session_file(self):
+        session_id = "11111111-1111-1111-1111-111111111111"
+        self._write_session_file(f"2026/05/11/rollout-2026-05-11T00-00-00-{session_id}.jsonl")
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": session_id, "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+
+        shutil.rmtree(self.config.session_scan_path, ignore_errors=True)
+        Path(self.config.session_scan_path).mkdir(parents=True, exist_ok=True)
+        await self.daemon._rescan_session_total(trigger_sync=True)
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["msg"], "Codex idle")
+
     async def test_approval_round_trip_acquires_then_releases_ble(self):
         async def fire_request():
             return await asyncio.to_thread(
@@ -684,6 +715,57 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         )
         self.assertTrue(changed)
         self.assertEqual(self.daemon._session.waiting_out, 0)
+        self.assertEqual(self.daemon._session.running, 0)
+
+    async def test_turn_aborted_in_session_log_clears_running_without_stop_hook(self):
+        session_id = "cccccccc-2222-3333-4444-555555555555"
+        path = Path(self.config.session_scan_path) / "2026/05/10" / f"rollout-2026-05-10T17-00-00-{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}) + "\n",
+            encoding="utf-8",
+        )
+
+        await asyncio.to_thread(
+            ipc.send_oneshot,
+            self.socket_path,
+            {"event": "user_prompt_submit", "payload": {"session_id": session_id, "turn_id": "t1"}},
+        )
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 1)
+
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "t1"}}) + "\n"
+            )
+
+        self.daemon._session_file_offsets[str(path)] = 0
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(self.daemon._session.running, 0)
+        self.daemon._request_state_sync()
+
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+                break
+
+        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertEqual(snapshot["running"], 0)
+        self.assertEqual(snapshot["msg"], "Codex idle")
 
     async def test_interactive_waiting_pushes_state_without_detail_payload(self):
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
