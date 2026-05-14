@@ -1,1 +1,1 @@
-"""Codex Desktop approval bridge for ClaudeCodeBuddy BLE devices."""
+"""Codex + OpenCode approval bridge for ClaudeCodeBuddy BLE devices."""

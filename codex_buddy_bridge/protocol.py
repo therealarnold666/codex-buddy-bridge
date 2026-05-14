@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 from typing import Any
+
+from .events import SignalSource
 
 PROMPT_TOOL_LIMIT = 19
 PROMPT_HINT_LIMIT = 43
@@ -22,6 +24,7 @@ class ApprovalRequest:
     id: str
     tool: str
     hint: str
+    source: SignalSource = SignalSource.CODEX
 
 
 class PermissionDecision(str, Enum):

@@ -32,6 +32,9 @@ from typing import Any, Optional
 
 from . import ipc
 from .ble_transport import BleTransport
+from .events import ApprovalEvent, SignalSource
+from .opencode_client import OpenCodeClient
+from .opencode_source import OpenCodeEventSource
 from .protocol import (
     ApprovalRequest,
     INTERACTIVE_OPTION_LIMIT,
@@ -292,6 +295,7 @@ class DaemonConfig:
     socket_path: str
     device_prefix: str
     address: Optional[str]
+    opencode_url: Optional[str] = None
     permission_wait: float = DEFAULT_PERMISSION_WAIT_SECONDS
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
     state_sync_interval: float = DEFAULT_STATE_SYNC_INTERVAL_SECONDS
@@ -376,6 +380,8 @@ class Daemon:
         self._session.set_total_tokens(self._token_ledger.total_tokens)
         self._session.set_today_tokens(self._token_ledger.today_tokens())
         self._server: asyncio.AbstractServer | None = None
+        self._opencode_client: OpenCodeClient | None = None
+        self._opencode_source: OpenCodeEventSource | None = None
         self._state_sync_event = asyncio.Event()
         self._state_sync_task: asyncio.Task[None] | None = None
         self._session_scan_task: asyncio.Task[None] | None = None
@@ -394,6 +400,16 @@ class Daemon:
 
     async def run(self) -> None:
         self._server = await ipc.serve(self.config.socket_path, self._handle_event)
+
+        # Optionally connect to OpenCode ACP
+        if self.config.opencode_url:
+            try:
+                await self._connect_opencode()
+            except Exception as exc:
+                self._log.warning(
+                    "OpenCode ACP connection failed: %s (Codex will still work)", exc
+                )
+
         self._ensure_background_tasks()
 
         loop = asyncio.get_running_loop()
@@ -404,9 +420,10 @@ class Daemon:
                 pass
 
         self._log.info(
-            "Daemon ready (on-demand BLE): socket=%s device_prefix=%s",
+            "Daemon ready (on-demand BLE): socket=%s device_prefix=%s opencode=%s",
             self.config.socket_path,
             self.config.device_prefix,
+            "ON" if self._opencode_client else "OFF",
         )
         try:
             await self._stop_event.wait()
@@ -433,6 +450,8 @@ class Daemon:
                 await self._interactive_task
             except asyncio.CancelledError:
                 pass
+        if self._opencode_client is not None:
+            await self._opencode_client.stop()
         await self._router.stop()
         if self._server is not None:
             self._server.close()
@@ -555,6 +574,25 @@ class Daemon:
 
         return None
 
+    async def _connect_opencode(self) -> None:
+        """Connect to OpenCode ACP server."""
+        self._opencode_client = OpenCodeClient(
+            self.config.opencode_url, self._log
+        )
+        await self._opencode_client.connect()
+        self._opencode_source = OpenCodeEventSource(self, self._log)
+        await self._opencode_client.subscribe_events(
+            self._opencode_source.on_event
+        )
+        self._log.info(
+            "Connected to OpenCode ACP at %s", self.config.opencode_url
+        )
+
+    async def _handle_approval(self, event: ApprovalEvent) -> dict[str, Any] | None:
+        """Unified permission handler — works for both Codex and OpenCode."""
+        async with self._ble_lock:
+            return await self._run_approval(event)
+
     async def _handle_permission_request(self, body: dict[str, Any]) -> dict[str, Any]:
         request = _request_from_payload(body)
         # Serialize: only one BLE session at a time. A second request waits
@@ -563,7 +601,16 @@ class Daemon:
         async with self._ble_lock:
             return await self._run_approval(request)
 
-    async def _run_approval(self, request: ApprovalRequest) -> dict[str, Any]:
+    async def _run_approval(
+        self, request: ApprovalRequest | ApprovalEvent
+    ) -> dict[str, Any] | None:
+        # Normalise to common fields
+        perm_id = getattr(request, "permission_id", request.id)
+        tool = request.tool
+        hint = request.hint
+        source = getattr(request, "source", SignalSource.CODEX)
+        session_id = getattr(request, "session_id", "")
+
         transport = BleTransport(
             device_name_prefix=self.config.device_prefix,
             address=self.config.address,
@@ -572,7 +619,7 @@ class Daemon:
         decision_future: asyncio.Future[PermissionDecision] = loop.create_future()
 
         def on_line(line: bytes):
-            return self._consume_decision(line, request.id, decision_future)
+            return self._consume_decision(line, perm_id, decision_future)
 
         try:
             await asyncio.wait_for(
@@ -580,10 +627,10 @@ class Daemon:
                 timeout=self.config.connect_timeout + 5.0,
             )
         except asyncio.TimeoutError:
-            self._log.warning("BLE connect timed out for %s", request.id)
+            self._log.warning("BLE connect timed out for %s", perm_id)
             return {"decision": "no_buddy", "reason": "BLE connect timed out"}
         except Exception as exc:  # noqa: BLE001 - Claude may hold the device
-            self._log.warning("BLE connect failed for %s: %s", request.id, exc)
+            self._log.warning("BLE connect failed for %s: %s", perm_id, exc)
             return {"decision": "no_buddy", "reason": str(exc)}
 
         try:
@@ -599,7 +646,12 @@ class Daemon:
                 msg=self._state_msg(),
             ))
             await transport.write_line(build_prompt_snapshot(
-                request,
+                ApprovalRequest(
+                    id=perm_id,
+                    tool=tool,
+                    hint=hint,
+                    source=source,
+                ),
                 running=self._session.running,
                 waiting=self._session.waiting_out,
                 total=self._session.total,
@@ -609,7 +661,7 @@ class Daemon:
             ))
             self._log.info(
                 "Pending approval %s for %s: %s (total=%d token_delta=%d host_tokens=%d tokens_today=%d running=%d waiting=%d)",
-                request.id, request.tool, request.hint,
+                perm_id, tool, hint,
                 self._session.total,
                 self._session.pending_tokens,
                 self._session.total_tokens,
@@ -620,7 +672,7 @@ class Daemon:
             try:
                 decision = await asyncio.wait_for(decision_future, timeout=self.config.permission_wait)
             except asyncio.TimeoutError:
-                self._log.warning("Approval %s timed out after %.0fs", request.id, self.config.permission_wait)
+                self._log.warning("Approval %s timed out after %.0fs", perm_id, self.config.permission_wait)
                 self._session.on_approved()
                 await transport.write_line(build_session_state_snapshot(
                     running=self._session.running,
@@ -645,14 +697,24 @@ class Daemon:
             # Final clear if no more sessions active
             if self._session.is_idle:
                 await transport.write_line(build_session_state_snapshot())
+
+            is_allow = decision is PermissionDecision.APPROVE_ONCE
+
+            # Reply to the source that originated this approval
+            if source == SignalSource.OPENCODE and self._opencode_client:
+                await self._opencode_client.reply_permission(
+                    session_id, perm_id, "once" if is_allow else "reject"
+                )
+                return None  # OpenCode is push-based, no return value
+
             return {
-                "decision": "allow" if decision is PermissionDecision.APPROVE_ONCE else "deny",
-                "request_id": request.id,
+                "decision": "allow" if is_allow else "deny",
+                "request_id": perm_id,
             }
         finally:
             try:
                 await transport.close()
-                self._log.info("Released BLE for %s", request.id)
+                self._log.info("Released BLE for %s", perm_id)
             except Exception as exc:  # noqa: BLE001
                 self._log.debug("close() raised: %s", exc)
             self._request_state_sync()
