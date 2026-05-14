@@ -71,23 +71,25 @@ def build_prompt_snapshot(
     tokens: int = 0,
     tokens_total: int = 0,
     tokens_today: int = 0,
+    usage: dict[str, Any] | None = None,
 ) -> str:
-    return _encode_line(
-        {
-            "total": total,
-            "running": running,
-            "waiting": waiting,
-            "tokens": tokens,
-            "tokens_total": tokens_total,
-            "tokens_today": tokens_today,
-            "msg": _truncate(f"approve: {approval.tool}", PROMPT_TOOL_LIMIT + 9),
-            "prompt": {
-                "id": approval.id,
-                "tool": _truncate(approval.tool, PROMPT_TOOL_LIMIT),
-                "hint": _truncate(approval.hint, PROMPT_HINT_LIMIT),
-            },
-        }
-    )
+    payload = {
+        "total": total,
+        "running": running,
+        "waiting": waiting,
+        "tokens": tokens,
+        "tokens_total": tokens_total,
+        "tokens_today": tokens_today,
+        "msg": _truncate(f"approve: {approval.tool}", PROMPT_TOOL_LIMIT + 9),
+        "prompt": {
+            "id": approval.id,
+            "tool": _truncate(approval.tool, PROMPT_TOOL_LIMIT),
+            "hint": _truncate(approval.hint, PROMPT_HINT_LIMIT),
+        },
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return _encode_line(payload)
 
 
 def build_clear_snapshot() -> str:
@@ -111,6 +113,7 @@ def build_session_state_snapshot(
     tokens_today: int = 0,
     msg: str | None = None,
     interactive: InteractivePrompt | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> str:
     state_msg = msg if msg is not None else ("Codex running" if running else "Codex idle")
     payload: dict[str, Any] = {
@@ -125,6 +128,8 @@ def build_session_state_snapshot(
     }
     if interactive is not None:
         payload["interactive"] = _interactive_payload(interactive)
+    if usage is not None:
+        payload["usage"] = usage
     return _encode_line(payload)
 
 

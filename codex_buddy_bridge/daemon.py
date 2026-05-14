@@ -108,6 +108,10 @@ class SessionState:
         "today_tokens",
         "total",
         "waiting",
+        "usage_primary_used_percent",
+        "usage_primary_resets_at",
+        "usage_secondary_used_percent",
+        "usage_secondary_resets_at",
     )
 
     def __init__(self) -> None:
@@ -116,6 +120,10 @@ class SessionState:
         self.total_tokens = 0
         self.today_tokens = 0
         self.waiting = 0
+        self.usage_primary_used_percent = 0
+        self.usage_primary_resets_at = 0
+        self.usage_secondary_used_percent = 0
+        self.usage_secondary_resets_at = 0
         self._active_turn_ids: set[str] = set()
         self._session_turn_ids: dict[str, str] = {}
         self._turn_session_ids: dict[str, str] = {}
@@ -167,6 +175,29 @@ class SessionState:
             return False
         self.today_tokens = tokens
         return True
+
+    def set_rate_limits(
+        self,
+        primary_used_percent: int | None,
+        primary_resets_at: int | None,
+        secondary_used_percent: int | None,
+        secondary_resets_at: int | None,
+    ) -> bool:
+        changed = False
+        values = (
+            ("usage_primary_used_percent", primary_used_percent),
+            ("usage_primary_resets_at", primary_resets_at),
+            ("usage_secondary_used_percent", secondary_used_percent),
+            ("usage_secondary_resets_at", secondary_resets_at),
+        )
+        for field, value in values:
+            if value is None:
+                continue
+            clean = max(0, int(value))
+            if getattr(self, field) != clean:
+                setattr(self, field, clean)
+                changed = True
+        return changed
 
     def add_pending_tokens(self, delta: int, today_total: int | None = None) -> bool:
         delta = max(0, delta)
@@ -392,6 +423,20 @@ class Daemon:
         self._interactive_task: asyncio.Task[None] | None = None
         self._router = CodexRouterClient(self._log)
 
+    def _usage_payload(self) -> dict[str, Any]:
+        return {
+            "five_hour": {
+                "used_percent": self._session.usage_primary_used_percent,
+                "remaining_percent": max(0, 100 - self._session.usage_primary_used_percent),
+                "resets_at": self._session.usage_primary_resets_at,
+            },
+            "weekly": {
+                "used_percent": self._session.usage_secondary_used_percent,
+                "remaining_percent": max(0, 100 - self._session.usage_secondary_used_percent),
+                "resets_at": self._session.usage_secondary_resets_at,
+            },
+        }
+
     async def run(self) -> None:
         self._server = await ipc.serve(self.config.socket_path, self._handle_event)
         self._ensure_background_tasks()
@@ -597,6 +642,7 @@ class Daemon:
                 tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
+                usage=self._usage_payload(),
             ))
             await transport.write_line(build_prompt_snapshot(
                 request,
@@ -606,6 +652,7 @@ class Daemon:
                 tokens=self._session.pending_tokens,
                 tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
+                usage=self._usage_payload(),
             ))
             self._log.info(
                 "Pending approval %s for %s: %s (total=%d token_delta=%d host_tokens=%d tokens_today=%d running=%d waiting=%d)",
@@ -630,6 +677,7 @@ class Daemon:
                     tokens_total=self._session.total_tokens,
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
+                    usage=self._usage_payload(),
                 ))
                 return {"decision": "timeout"}
             self._session.on_approved()
@@ -641,6 +689,7 @@ class Daemon:
                 tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
+                usage=self._usage_payload(),
             ))
             # Final clear if no more sessions active
             if self._session.is_idle:
@@ -725,18 +774,22 @@ class Daemon:
     async def _rescan_session_total(self, trigger_sync: bool) -> None:
         total = await asyncio.to_thread(_count_session_files, self.config.session_scan_path)
         session_ids = await asyncio.to_thread(_list_session_ids, self.config.session_scan_path)
+        rate_limits = await asyncio.to_thread(_scan_latest_rate_limits, self.config.session_scan_path)
         changed = self._session.set_total(total)
         removed_session_ids = self._known_session_ids - session_ids
         reconciled = self._session.reconcile_sessions(removed_session_ids) if removed_session_ids else False
+        usage_changed = self._session.set_rate_limits(*rate_limits)
         self._known_session_ids = session_ids
-        if changed or reconciled:
+        if changed or reconciled or usage_changed:
             self._log.debug(
-                "Session total refreshed from disk: total=%d reconciled=%s running=%d",
+                "Session total refreshed from disk: total=%d reconciled=%s running=%d usage5h=%d usageWeek=%d",
                 total,
                 reconciled,
                 self._session.running,
+                self._session.usage_primary_used_percent,
+                self._session.usage_secondary_used_percent,
             )
-            if trigger_sync:
+            if trigger_sync or usage_changed or changed or reconciled:
                 self._request_state_sync()
 
     async def _scan_interactive_from_sessions(self) -> None:
@@ -844,6 +897,7 @@ class Daemon:
                     tokens_total=self._session.total_tokens,
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
+                    usage=self._usage_payload(),
                 ))
                 self._last_state_sync_monotonic = asyncio.get_running_loop().time()
                 self._log.debug(
@@ -933,6 +987,7 @@ class Daemon:
                                 tokens_total=self._session.total_tokens,
                                 tokens_today=self._session.today_tokens,
                                 msg=self._state_msg(),
+                                usage=self._usage_payload(),
                             )
                         )
                         return
@@ -948,6 +1003,7 @@ class Daemon:
                                 tokens_today=self._session.today_tokens,
                                 msg=self._state_msg(),
                                 interactive=snapshot.prompt,
+                                usage=self._usage_payload(),
                             )
                         )
                         last_version = snapshot.version
@@ -1407,6 +1463,54 @@ def _scan_session_output_tokens(path: Path) -> int:
     except OSError:
         return 0
     return best
+
+
+def _scan_latest_rate_limits(scan_path: str) -> tuple[int | None, int | None, int | None, int | None]:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return (None, None, None, None)
+
+    latest_ts = ""
+    latest: tuple[int | None, int | None, int | None, int | None] = (None, None, None, None)
+    for path in root.rglob("*.jsonl"):
+        if not path.is_file():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if '"type":"token_count"' not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = obj.get("payload")
+                    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                        continue
+                    rate_limits = payload.get("rate_limits")
+                    if not isinstance(rate_limits, dict):
+                        continue
+                    primary = rate_limits.get("primary")
+                    secondary = rate_limits.get("secondary")
+                    if not isinstance(primary, dict) or not isinstance(secondary, dict):
+                        continue
+                    timestamp = obj.get("timestamp")
+                    if not isinstance(timestamp, str) or timestamp < latest_ts:
+                        continue
+                    primary_used = primary.get("used_percent")
+                    primary_reset = primary.get("resets_at")
+                    secondary_used = secondary.get("used_percent")
+                    secondary_reset = secondary.get("resets_at")
+                    latest_ts = timestamp
+                    latest = (
+                        int(primary_used) if isinstance(primary_used, (int, float)) else None,
+                        int(primary_reset) if isinstance(primary_reset, int) else None,
+                        int(secondary_used) if isinstance(secondary_used, (int, float)) else None,
+                        int(secondary_reset) if isinstance(secondary_reset, int) else None,
+                    )
+        except OSError:
+            continue
+    return latest
 
 
 def _find_session_file(scan_path: str, session_id: str) -> Path | None:
