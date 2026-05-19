@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import socket
 import shutil
 import tempfile
 import unittest
@@ -71,6 +72,10 @@ class FakeRouterClient:
         return self.submit_ok
 
 
+def _latest_transport_with_lines():
+    return next((transport for transport in reversed(FakeBleTransport.instances) if transport.lines), None)
+
+
 class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         FakeBleTransport.instances.clear()
@@ -78,7 +83,7 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
         self.transport_factory.start()
 
         self.tmpdir = tempfile.mkdtemp()
-        self.socket_path = os.path.join(self.tmpdir, "test.sock")
+        self.socket_path = _make_test_endpoint(self.tmpdir)
         self.config = DaemonConfig(
             socket_path=self.socket_path,
             device_prefix="Claude-",
@@ -111,11 +116,24 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
                 pass
         self.server.close()
         await self.server.wait_closed()
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+        if ipc.endpoint_has_filesystem_artifact(self.socket_path):
+            try:
+                os.unlink(self.socket_path)
+            except FileNotFoundError:
+                pass
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+def _make_test_endpoint(tmpdir: str) -> str:
+    if ipc.supports_unix_sockets():
+        return os.path.join(tmpdir, "test.sock")
+    return f"tcp://127.0.0.1:{_reserve_tcp_port()}"
+
+
+def _reserve_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
@@ -134,13 +152,15 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
             {"event": "session_start", "payload": {"session_id": "s1", "cwd": "/repo", "source": "startup"}},
         )
 
+        transport = None
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = next((t for t in reversed(FakeBleTransport.instances) if t.lines), None)
+            if transport is not None:
                 break
 
         self.assertTrue(FakeBleTransport.instances, "session_start never triggered a BLE sync")
-        transport = FakeBleTransport.instances[-1]
+        self.assertIsNotNone(transport, "session_start never produced a BLE snapshot")
         self.assertTrue(any('"time"' in line for line in transport.lines), "missing time frame")
         self.assertTrue(any('"cmd":"owner"' in line for line in transport.lines), "missing owner frame")
 
@@ -179,7 +199,9 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(120):
             await asyncio.sleep(0.02)
-            if len(FakeBleTransport.instances) >= 2:
+            if len(FakeBleTransport.instances) >= 2 and all(
+                transport.lines for transport in FakeBleTransport.instances[:2]
+            ):
                 break
 
         self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "expected repeated idle heartbeats")
@@ -197,11 +219,14 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
 
         self.assertTrue(FakeBleTransport.instances, "user_prompt_submit never triggered a BLE sync")
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "user_prompt_submit never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["running"], 1)
         self.assertEqual(snapshot["waiting"], 0)
 
@@ -212,10 +237,13 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
 
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "duplicate prompt never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["running"], 1)
 
     async def test_new_turn_in_same_session_replaces_stale_turn(self):
@@ -248,10 +276,13 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if len(FakeBleTransport.instances) >= 2 and transport is not None:
                 break
 
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "turn aborted state sync never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["running"], 0)
         self.assertEqual(snapshot["msg"], "Codex idle")
 
@@ -408,7 +439,8 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
 
         await asyncio.to_thread(
@@ -419,11 +451,14 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if len(FakeBleTransport.instances) >= 2 and transport is not None:
                 break
 
         self.assertGreaterEqual(len(FakeBleTransport.instances), 2, "stop never triggered a BLE sync")
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "stop never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["tokens"], 125)
         self.assertEqual(snapshot["tokens_today"], 125)
         self.assertEqual(snapshot["running"], 0)
@@ -439,7 +474,8 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
 
         await asyncio.to_thread(
@@ -450,10 +486,13 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if len(FakeBleTransport.instances) >= 2 and transport is not None:
                 break
 
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "stop without turn id never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["running"], 0)
         self.assertEqual(snapshot["msg"], "Codex idle")
 
@@ -470,9 +509,12 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         )
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "interactive start never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["running"], 1)
         self.assertEqual(snapshot["waiting"], 1)
         self.assertEqual(snapshot["msg"], "input needed")
@@ -504,9 +546,12 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.daemon._request_state_sync()
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "stacked waiting state never produced a BLE snapshot")
+        snapshot = json.loads(transport.lines[-1])
         self.assertEqual(snapshot["waiting"], 2)
         self.assertEqual(snapshot["msg"], "approve: tool")
 
@@ -827,13 +872,16 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
 
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            transport = _latest_transport_with_lines()
+            if transport is not None:
                 break
 
+        transport = _latest_transport_with_lines()
+        self.assertIsNotNone(transport, "interactive waiting never produced a BLE snapshot")
         self.assertTrue(FakeBleTransport.instances)
-        self.assertFalse(any('"interactive"' in line for line in FakeBleTransport.instances[-1].lines))
-        self.assertTrue(any('"waiting":1' in line for line in FakeBleTransport.instances[-1].lines))
-        self.assertTrue(any('"msg":"choice needed"' in line for line in FakeBleTransport.instances[-1].lines))
+        self.assertFalse(any('"interactive"' in line for line in transport.lines))
+        self.assertTrue(any('"waiting":1' in line for line in transport.lines))
+        self.assertTrue(any('"msg":"choice needed"' in line for line in transport.lines))
         self.assertIsNone(self.daemon._interactive_task)
         self.assertEqual(self.daemon._interactive_snapshot.prompt.question_index, 0)
         self.assertEqual(self.daemon._interactive_snapshot.prompt.question_total, 2)
