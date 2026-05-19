@@ -22,7 +22,6 @@ import logging
 import os
 from pathlib import Path
 import re
-import pwd
 import shutil
 import signal
 import time
@@ -482,10 +481,11 @@ class Daemon:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-        try:
-            os.unlink(self.config.socket_path)
-        except FileNotFoundError:
-            pass
+        if ipc.endpoint_has_filesystem_artifact(self.config.socket_path):
+            try:
+                os.unlink(self.config.socket_path)
+            except FileNotFoundError:
+                pass
 
     async def _handle_event(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         event = payload.get("event")
@@ -779,17 +779,27 @@ class Daemon:
         removed_session_ids = self._known_session_ids - session_ids
         reconciled = self._session.reconcile_sessions(removed_session_ids) if removed_session_ids else False
         usage_changed = self._session.set_rate_limits(*rate_limits)
+        token_changed = await asyncio.to_thread(
+            _refresh_token_ledger_from_sessions,
+            self.config.session_scan_path,
+            self._token_ledger,
+        )
+        if token_changed:
+            self._session.set_total_tokens(self._token_ledger.total_tokens)
+            self._session.set_today_tokens(self._token_ledger.today_tokens())
         self._known_session_ids = session_ids
-        if changed or reconciled or usage_changed:
+        if changed or reconciled or usage_changed or token_changed:
             self._log.debug(
-                "Session total refreshed from disk: total=%d reconciled=%s running=%d usage5h=%d usageWeek=%d",
+                "Session total refreshed from disk: total=%d reconciled=%s running=%d usage5h=%d usageWeek=%d host_tokens=%d tokens_today=%d",
                 total,
                 reconciled,
                 self._session.running,
                 self._session.usage_primary_used_percent,
                 self._session.usage_secondary_used_percent,
+                self._session.total_tokens,
+                self._session.today_tokens,
             )
-            if trigger_sync or usage_changed or changed or reconciled:
+            if trigger_sync or usage_changed or changed or reconciled or token_changed:
                 self._request_state_sync()
 
     async def _scan_interactive_from_sessions(self) -> None:
@@ -1465,6 +1475,26 @@ def _scan_session_output_tokens(path: Path) -> int:
     return best
 
 
+def _refresh_token_ledger_from_sessions(scan_path: str, ledger: TokenLedger) -> bool:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return False
+
+    changed = False
+    for path in root.rglob("*.jsonl"):
+        if not path.is_file():
+            continue
+        session_id = _session_id_from_path(str(path))
+        if not session_id:
+            continue
+        absolute_total = _scan_session_output_tokens(path)
+        if absolute_total <= 0:
+            continue
+        if ledger.record_session_total(session_id, absolute_total):
+            changed = True
+    return changed
+
+
 def _scan_latest_rate_limits(scan_path: str) -> tuple[int | None, int | None, int | None, int | None]:
     root = Path(scan_path).expanduser()
     if not root.exists():
@@ -1598,6 +1628,15 @@ def _consume_interactive_event(
         if previous and previous != turn_id:
             changed = _end_interactive_for_turn(previous, interactive_calls, session_state, log) or changed
         turn_by_file[file_path] = turn_id
+        if session_state.on_user_prompt_submit(session_id, turn_id):
+            log.debug(
+                "Turn inferred start from session log: session=%s turn=%s running=%d waiting_out=%d",
+                session_id,
+                turn_id,
+                session_state.running,
+                session_state.waiting_out,
+            )
+            changed = True
     elif entry_type == "turn_context" and turn_id:
         previous = turn_by_file.get(file_path)
         if previous and previous != turn_id:
@@ -1831,6 +1870,8 @@ def _local_today_key() -> str:
 
 def _owner_name() -> str:
     try:
+        import pwd
+
         gecos = pwd.getpwuid(os.getuid()).pw_gecos
         first = (gecos or "").split(",", 1)[0].strip()
         if first:
