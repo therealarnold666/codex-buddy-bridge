@@ -114,6 +114,12 @@ class IpcTests(unittest.TestCase):
         result = ipc.send_and_wait(_missing_endpoint(), {"event": "x"}, timeout=0.5)
         self.assertIsNone(result)
 
+    def test_windows_default_tcp_endpoint_matches_installer_port(self):
+        if ipc.supports_unix_sockets():
+            self.assertEqual(ipc.DEFAULT_SOCKET_PATH, "/tmp/codex-buddy.sock")
+        else:
+            self.assertEqual(ipc.DEFAULT_SOCKET_PATH, "tcp://127.0.0.1:8876")
+
 
 def _make_test_endpoint(tmpdir: str) -> str:
     if ipc.supports_unix_sockets():

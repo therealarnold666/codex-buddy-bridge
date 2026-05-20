@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 DEFAULT_TCP_HOST = "127.0.0.1"
-DEFAULT_TCP_PORT = 8765
+DEFAULT_TCP_PORT = 8876
 
 
 def supports_unix_sockets() -> bool:

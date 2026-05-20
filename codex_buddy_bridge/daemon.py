@@ -211,6 +211,10 @@ class SessionState:
     def clear_pending_tokens(self) -> None:
         self.pending_tokens = 0
 
+    @property
+    def active_session_ids(self) -> set[str]:
+        return set(self._session_turn_ids)
+
     def on_user_prompt_submit(self, session_id: str | None, turn_id: str | None) -> bool:
         if turn_id:
             replaced = False
@@ -783,6 +787,7 @@ class Daemon:
             _refresh_token_ledger_from_sessions,
             self.config.session_scan_path,
             self._token_ledger,
+            self._session.active_session_ids,
         )
         if token_changed:
             self._session.set_total_tokens(self._token_ledger.total_tokens)
@@ -1475,17 +1480,27 @@ def _scan_session_output_tokens(path: Path) -> int:
     return best
 
 
-def _refresh_token_ledger_from_sessions(scan_path: str, ledger: TokenLedger) -> bool:
+def _refresh_token_ledger_from_sessions(
+    scan_path: str,
+    ledger: TokenLedger,
+    active_session_ids: set[str] | None = None,
+) -> bool:
     root = Path(scan_path).expanduser()
     if not root.exists():
         return False
 
+    active_session_ids = active_session_ids or set()
     changed = False
     for path in root.rglob("*.jsonl"):
         if not path.is_file():
             continue
         session_id = _session_id_from_path(str(path))
         if not session_id:
+            continue
+        # Do not advance the persistent ledger for a turn that is still
+        # running. Otherwise the background rescan can consume the current
+        # turn's growth before the Stop hook reports it to the buddy.
+        if session_id in active_session_ids:
             continue
         absolute_total = _scan_session_output_tokens(path)
         if absolute_total <= 0:

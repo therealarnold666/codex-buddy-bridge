@@ -41,7 +41,9 @@ function Ensure-CodexHooksEnabled {
 
 function New-HookCommand([string]$ScriptName) {
     $scriptPath = Join-Path $BridgeRoot "hooks\$ScriptName"
-    return "powershell -NoProfile -ExecutionPolicy Bypass -Command `"$env:CODEX_BUDDY_SOCKET='$SocketEndpoint'; & '$VenvPython' '$scriptPath'`""
+    $wrapperPath = Join-Path $BridgeRoot "scripts\hook_wrapper.ps1"
+    $logPath = Join-Path $BridgeRoot "hook-invocations.log"
+    return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`" -PythonExe `"$VenvPython`" -HookScript `"$scriptPath`" -HookName `"$ScriptName`" -LogPath `"$logPath`" -SocketEndpoint `"$SocketEndpoint`""
 }
 
 Step "Bridge root: $BridgeRoot"
