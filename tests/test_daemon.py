@@ -41,7 +41,7 @@ class FakeBleTransport:
         self.close_calls += 1
         self.is_connected = False
 
-    async def write_line(self, line: str) -> None:
+    async def write_line(self, line: str, *, response: bool = False) -> None:
         self.lines.append(line)
 
     async def deliver(self, line: bytes) -> None:

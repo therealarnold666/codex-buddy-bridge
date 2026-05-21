@@ -634,16 +634,6 @@ class Daemon:
         try:
             await self._send_greeting(transport)
             self._session.on_waiting()
-            await transport.write_line(build_session_state_snapshot(
-                running=self._session.running,
-                waiting=self._session.waiting_out,
-                total=self._session.total,
-                tokens=self._session.pending_tokens,
-                tokens_total=self._session.total_tokens,
-                tokens_today=self._session.today_tokens,
-                msg=self._state_msg(),
-                usage=self._usage_payload(),
-            ))
             await transport.write_line(build_prompt_snapshot(
                 request,
                 running=self._session.running,
@@ -653,7 +643,7 @@ class Daemon:
                 tokens_total=self._session.total_tokens,
                 tokens_today=self._session.today_tokens,
                 usage=self._usage_payload(),
-            ))
+            ), response=True)
             self._log.info(
                 "Pending approval %s for %s: %s (total=%d token_delta=%d host_tokens=%d tokens_today=%d running=%d waiting=%d)",
                 request.id, request.tool, request.hint,
@@ -678,7 +668,7 @@ class Daemon:
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
                     usage=self._usage_payload(),
-                ))
+                ), response=True)
                 return {"decision": "timeout"}
             self._session.on_approved()
             await transport.write_line(build_session_state_snapshot(
@@ -690,10 +680,10 @@ class Daemon:
                 tokens_today=self._session.today_tokens,
                 msg=self._state_msg(),
                 usage=self._usage_payload(),
-            ))
+            ), response=True)
             # Final clear if no more sessions active
             if self._session.is_idle:
-                await transport.write_line(build_session_state_snapshot())
+                await transport.write_line(build_session_state_snapshot(), response=True)
             return {
                 "decision": "allow" if decision is PermissionDecision.APPROVE_ONCE else "deny",
                 "request_id": request.id,
@@ -727,8 +717,8 @@ class Daemon:
         epoch = int(time.time())
         tz_offset = -time.timezone if time.daylight == 0 else -time.altzone
         try:
-            await transport.write_line(build_time_frame(epoch, tz_offset))
-            await transport.write_line(build_owner_frame(_owner_name()))
+            await transport.write_line(build_time_frame(epoch, tz_offset), response=True)
+            await transport.write_line(build_owner_frame(_owner_name()), response=True)
         except Exception as exc:  # noqa: BLE001
             self._log.debug("Greeting frames failed (non-fatal): %s", exc)
 
@@ -898,7 +888,7 @@ class Daemon:
                     tokens_today=self._session.today_tokens,
                     msg=self._state_msg(),
                     usage=self._usage_payload(),
-                ))
+                ), response=True)
                 self._last_state_sync_monotonic = asyncio.get_running_loop().time()
                 self._log.debug(
                     "Pushed state sync (%s): total=%d token_delta=%d host_tokens=%d tokens_today=%d running=%d waiting=%d",
@@ -988,7 +978,8 @@ class Daemon:
                                 tokens_today=self._session.today_tokens,
                                 msg=self._state_msg(),
                                 usage=self._usage_payload(),
-                            )
+                            ),
+                            response=True,
                         )
                         return
 
@@ -1004,7 +995,8 @@ class Daemon:
                                 msg=self._state_msg(),
                                 interactive=snapshot.prompt,
                                 usage=self._usage_payload(),
-                            )
+                            ),
+                            response=True,
                         )
                         last_version = snapshot.version
 

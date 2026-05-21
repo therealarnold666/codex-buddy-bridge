@@ -65,12 +65,16 @@ class BleTransport:
                 self._log.debug("Disconnect raised: %s", exc)
             self._client = None
 
-    async def write_line(self, line: str) -> None:
+    async def write_line(self, line: str, *, response: bool = False) -> None:
         if self._client is None:
             return
         data = line.encode("utf-8")
         for start in range(0, len(data), 160):
-            await self._client.write_gatt_char(NUS_RX_UUID, data[start : start + 160], response=False)
+            await self._client.write_gatt_char(
+                NUS_RX_UUID,
+                data[start : start + 160],
+                response=response,
+            )
             await asyncio.sleep(0.01)
 
     def _handle_notify(self, _sender: object, data: bytearray) -> None:
@@ -119,10 +123,10 @@ class BleConnectionManager:
     def is_connected(self) -> bool:
         return self._transport.is_connected
 
-    async def write_line(self, line: str) -> None:
+    async def write_line(self, line: str, *, response: bool = False) -> None:
         if self._transport.is_connected:
             try:
-                await self._transport.write_line(line)
+                await self._transport.write_line(line, response=response)
             except Exception as exc:  # noqa: BLE001 - reconnect loop will recover
                 self._log.warning("write_line failed: %s; will reconnect", exc)
                 await self._transport.close()
