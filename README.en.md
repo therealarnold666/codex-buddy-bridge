@@ -23,6 +23,8 @@ instead of clicking through prompts in the app.
 
 Compared with upstream `Yamiqu/codex-buddy-bridge`, this repo adds:
 
+- Windows Codex Desktop compatibility using a local TCP IPC endpoint
+  (`tcp://127.0.0.1:8876`) plus PowerShell hook wrappers.
 - Hook coverage beyond `PermissionRequest`:
   `SessionStart + UserPromptSubmit + Stop`, with turn-level runtime state.
 - `running` is now tracked per turn (not just session-start counting),
@@ -37,6 +39,20 @@ Compared with upstream `Yamiqu/codex-buddy-bridge`, this repo adds:
 - Event state-sync retry window to reduce dropped `running=0` updates when
   BLE advertising is duty-cycled.
 - New Linux CLI command: `codex-buddy pair` (`bluetoothctl` pair/trust/connect helper).
+
+## Interactive waiting
+
+- Today, the stable hook flow we rely on is
+  `PermissionRequest / SessionStart / UserPromptSubmit / Stop`.
+- `InteractiveStart` and `InteractiveEnd` are still registered by the
+  installers as forward-compatible placeholders. Some Codex builds may emit
+  them in the future, but the current stable path should not depend on them.
+- For current Codex Desktop builds, interactive waiting is inferred from
+  `~/.codex/sessions/**/*.jsonl` by scanning `request_user_input` calls and
+  their completion events.
+- The buddy is currently an **indicator only** for interactive prompts: it
+  can surface "input needed" / "choice needed", but answers still need to be
+  submitted in the Codex Desktop UI.
 
 ## How it works
 
@@ -69,7 +85,7 @@ its native approval prompt. **Codex never hangs because of this bridge.**
 
 ## Requirements
 
-- macOS (the daemon depends on `launchd` and Unix domain sockets).
+- macOS or Windows.
 - A `Claude-…` BLE device running the firmware from
   [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)
   — any of the supported boards (M5StickC Plus, M5StickC S3, etc.) works.
@@ -80,6 +96,8 @@ its native approval prompt. **Codex never hangs because of this bridge.**
 - Python 3.9+.
 
 ## Install
+
+### macOS
 
 ```bash
 git clone https://github.com/Yamiqu/codex-buddy-bridge.git
@@ -93,8 +111,9 @@ The installer:
 2. Renders the launchd plist with absolute paths and `launchctl load`s it.
    The daemon respawns on crash.
 3. Adds `[features]\ncodex_hooks = true` to `~/.codex/config.toml`.
-4. Writes `~/.codex/hooks.json` with a `PermissionRequest` entry pointing at
-   `hooks/permission_request.py`. Any existing `hooks.json` is backed up.
+4. Writes `~/.codex/hooks.json` with `PermissionRequest`, `SessionStart`,
+   `UserPromptSubmit`, `Stop`, `InteractiveStart`, and `InteractiveEnd`
+   command hooks. Any existing `hooks.json` is backed up.
 5. Prints next manual steps.
 
 After install:
@@ -104,6 +123,33 @@ After install:
 - **Approve the macOS Bluetooth prompt** the first time the daemon needs
   the buddy. The prompt targets `.venv/bin/python3`; once granted,
   launchd-spawned runs inherit the permission.
+
+### Windows
+
+```powershell
+git clone https://github.com/Yamiqu/codex-buddy-bridge.git
+cd codex-buddy-bridge
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+```
+
+The Windows installer:
+
+1. Creates `.venv\` and installs `bleak`.
+2. Adds `[features]\ncodex_hooks = true` to `~/.codex/config.toml`.
+3. Writes `~/.codex/hooks.json` with `PermissionRequest`, `SessionStart`,
+   `UserPromptSubmit`, `Stop`, `InteractiveStart`, and `InteractiveEnd`
+   command hooks.
+4. Routes those command hooks through `scripts/hook_wrapper.ps1`, which sets
+   `CODEX_BUDDY_SOCKET=tcp://127.0.0.1:8876` before invoking each Python hook.
+
+After install:
+
+- **Restart Codex Desktop** so it reloads the hooks config.
+- Start the daemon before using the bridge:
+
+```powershell
+.venv\Scripts\python.exe -m codex_buddy_bridge --socket tcp://127.0.0.1:8876 --debug
+```
 
 ## CLI
 
@@ -153,7 +199,7 @@ echo '{"event":"permission_request","payload":{"session_id":"s","turn_id":"t","t
 | --- | --- | --- |
 | `--device-prefix` | `Claude-` | BLE name prefix to scan for |
 | `--address` | (none) | skip scanning, use this BLE address |
-| `--socket` | `/tmp/codex-buddy.sock` | Unix socket path |
+| `--socket` | `/tmp/codex-buddy.sock` on POSIX, `tcp://127.0.0.1:8876` on Windows | Hook IPC endpoint |
 | `--debug` | off | verbose logging |
 
 ## Coexistence with Claude Hardware Buddy
@@ -240,9 +286,13 @@ tests/
   `codex --version` and update if hooks don't fire.
 - **Codex Desktop App vs. CLI.** Hooks fire in Codex's app-server, which
   both clients use, so this bridge works for both.
-- **macOS only.** The bridge depends on launchd and Unix sockets. The
-  protocol layer is portable; a Linux systemd-user unit would be a small
-  additional file. PRs welcome.
+- **Windows uses local TCP instead of Unix sockets.** The default Windows
+  endpoint is `tcp://127.0.0.1:8876`, and `install_windows.ps1` wires every
+  hook through `scripts/hook_wrapper.ps1` so they all share the same
+  `CODEX_BUDDY_SOCKET` value.
+- **Interactive prompts are surfaced, not answered, on the buddy.** The
+  current bridge reports interactive waiting state but does not submit
+  answers back from the stick. Complete those prompts in Codex Desktop.
 - **Firmware is unchanged.** The wire format (NUS UUIDs, snapshot fields,
   permission decision shape) follows the
   [REFERENCE.md](https://github.com/anthropics/claude-desktop-buddy/blob/main/REFERENCE.md)

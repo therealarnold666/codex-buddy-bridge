@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import ipc
 from .protocol import InteractivePrompt
 
 ROUTER_SOCKET_DIR = Path("/tmp/codex-ipc")
@@ -82,6 +83,9 @@ def find_matching_user_input_request_id(
 
 
 def resolve_router_socket() -> Path | None:
+    if not ipc.supports_unix_sockets():
+        return None
+
     from_env = os.environ.get("CODEX_IPC_SOCKET")
     if from_env:
         candidate = Path(from_env).expanduser()
