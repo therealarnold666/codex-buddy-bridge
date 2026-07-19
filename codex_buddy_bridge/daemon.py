@@ -216,6 +216,10 @@ class SessionState:
     def active_session_ids(self) -> set[str]:
         return set(self._session_turn_ids)
 
+    @property
+    def active_turn_ids(self) -> set[str]:
+        return set(self._active_turn_ids)
+
     def on_user_prompt_submit(self, session_id: str | None, turn_id: str | None) -> bool:
         if turn_id:
             replaced = False
@@ -788,9 +792,9 @@ class Daemon:
         removed_session_ids = self._known_session_ids - session_ids
         reconciled = self._session.reconcile_sessions(removed_session_ids) if removed_session_ids else False
         self._recent_session_files = _merge_recent_session_files(
-            self._recent_session_files,
             recent_files,
             self._session_turn_by_file,
+            self._session.active_turn_ids,
         )
         usage_changed = self._session.set_rate_limits(*rate_limits)
         token_changed = await asyncio.to_thread(
@@ -1500,11 +1504,15 @@ def _scan_session_inventory(scan_path: str, recent_limit: int) -> tuple[int, set
 
 
 def _merge_recent_session_files(
-    existing: set[str],
     scanned_recent: set[str],
     turn_by_file: dict[str, str],
+    active_turn_ids: set[str],
 ) -> set[str]:
-    active_files = {path for path in turn_by_file if path in existing or Path(path).exists()}
+    active_files = {
+        path
+        for path, turn_id in turn_by_file.items()
+        if turn_id in active_turn_ids and Path(path).exists()
+    }
     return set(scanned_recent) | active_files
 
 
@@ -1659,7 +1667,7 @@ def _scan_interactive_events_from_files(
         session_files = {str(path) for path in root.rglob("*.jsonl") if path.is_file()}
     files = sorted(session_files)
     current = {fp for fp in files if Path(fp).is_file()}
-    for removed in set(files) - current:
+    for removed in (set(offsets) | set(turn_by_file)) - current:
         offsets.pop(removed, None)
         turn_by_file.pop(removed, None)
     for fp in sorted(current):

@@ -256,6 +256,40 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
         self.assertEqual(full_rescans, 1)
         self.assertGreaterEqual(interactive_scans, 3)
 
+    async def test_recent_session_files_keep_only_recent_and_active_files(self):
+        active = Path(self.config.session_scan_path) / "active.jsonl"
+        stale = Path(self.config.session_scan_path) / "stale.jsonl"
+        active.write_text("{}\n", encoding="utf-8")
+        stale.write_text("{}\n", encoding="utf-8")
+
+        merged = daemon_module._merge_recent_session_files(
+            {"recent.jsonl"},
+            {str(active): "turn-active", str(stale): "turn-stale"},
+            {"turn-active"},
+        )
+
+        self.assertEqual(merged, {"recent.jsonl", str(active)})
+
+    async def test_interactive_scan_prunes_files_outside_recent_set(self):
+        stale = Path(self.config.session_scan_path) / "stale.jsonl"
+        stale.write_text("{}\n", encoding="utf-8")
+        self.daemon._session_file_offsets[str(stale)] = 10
+        self.daemon._session_turn_by_file[str(stale)] = "turn-stale"
+
+        changed = daemon_module._scan_interactive_events_from_files(
+            self.config.session_scan_path,
+            self.daemon._session_file_offsets,
+            self.daemon._session_turn_by_file,
+            self.daemon._interactive_calls,
+            self.daemon._session,
+            self.daemon._log,
+            set(),
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(self.daemon._session_file_offsets, {})
+        self.assertEqual(self.daemon._session_turn_by_file, {})
+
     async def test_user_prompt_submit_pushes_running_state_over_ble(self):
         await asyncio.to_thread(
             ipc.send_oneshot,
