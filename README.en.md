@@ -38,7 +38,7 @@ Compared with upstream `Yamiqu/codex-buddy-bridge`, this repo adds:
   - per-session absolute baselines
 - Event state-sync retry window to reduce dropped `running=0` updates when
   BLE advertising is duty-cycled.
-- New Linux CLI command: `codex-buddy pair` (`bluetoothctl` pair/trust/connect helper).
+- New Linux CLI command: `codex-buddy pair`: scan and prepare the agent, then open interactive `bluetoothctl` so the user can run `pair`, watch the Buddy passkey flow, and finally auto-run trust / disconnect.
 
 ## Interactive waiting
 
@@ -164,7 +164,7 @@ The bridge ships a small `codex-buddy` script for everyday control:
 | `codex-buddy log` | `tail -F` the daemon log |
 | `codex-buddy foreground` | stop the launchd copy and run the daemon in this terminal with `--debug`. Ctrl-C to quit; no respawn |
 | `codex-buddy probe` | scan BLE briefly and report what's visible — useful when the log says "No BLE device found" |
-| `codex-buddy pair` | Linux helper that runs `bluetoothctl` pair/trust/connect (supports `--prefix` or `--mac`) |
+| `codex-buddy pair` | Linux helper that scans first, then opens interactive `bluetoothctl` for the `pair` step and finally runs trust / disconnect (supports `--prefix` or `--mac`) |
 | `codex-buddy uninstall` | unload, remove plist, remove `~/.codex/hooks.json` (backed up) |
 
 Tip: drop an alias in your shell rc to make it global:

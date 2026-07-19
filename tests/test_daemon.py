@@ -1173,5 +1173,23 @@ class RequestSynthesisTests(unittest.TestCase):
         self.assertTrue(req.id.startswith("c-"))
 
 
+class RateLimitScanTests(unittest.TestCase):
+    def test_scan_latest_rate_limits_accepts_primary_only_weekly_format(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "2026/07/19/rollout-2026-07-19T10-00-00-s1.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                (
+                    '{"timestamp":"2026-07-11T10:00:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":9.0,"window_minutes":300,"resets_at":1783000000},"secondary":{"used_percent":17.0,"window_minutes":10080,"resets_at":1783600000}}}}\n'
+                    '{"timestamp":"2026-07-19T10:00:02.311Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":4.0,"window_minutes":10080,"resets_at":1785057722},"secondary":null}}}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            rate_limits = daemon_module._scan_latest_rate_limits(tmpdir)
+
+        self.assertEqual(rate_limits, (None, None, 4, 1785057722))
+
+
 if __name__ == "__main__":
     unittest.main()

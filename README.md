@@ -20,7 +20,7 @@
 - `sessions`、token、interactive waiting 可从 `~/.codex/sessions/**/*.jsonl` 增量扫描补齐。
 - token 账本持久化：保存 lifetime total、`tokens_today`、以及每个 session 的绝对 output total。
 - BLE 状态同步增加重试窗口，减少 duty-cycle 广播场景下的 busy->idle 漏同步。
-- Linux 新增 `codex-buddy pair` 辅助命令，用 `bluetoothctl` 做 pair / trust / connect。
+- Linux 新增 `codex-buddy pair` 辅助命令：先扫描并准备 agent，再进入交互式 `bluetoothctl` 让用户执行 `pair`、观察 Buddy 配对码，之后自动做 trust / disconnect。
 
 ## Interactive Waiting 说明
 

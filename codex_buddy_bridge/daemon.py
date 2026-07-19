@@ -1529,22 +1529,42 @@ def _scan_latest_rate_limits(scan_path: str) -> tuple[int | None, int | None, in
                         continue
                     primary = rate_limits.get("primary")
                     secondary = rate_limits.get("secondary")
-                    if not isinstance(primary, dict) or not isinstance(secondary, dict):
+                    if not isinstance(primary, dict) and not isinstance(secondary, dict):
                         continue
                     timestamp = obj.get("timestamp")
                     if not isinstance(timestamp, str) or timestamp < latest_ts:
                         continue
-                    primary_used = primary.get("used_percent")
-                    primary_reset = primary.get("resets_at")
-                    secondary_used = secondary.get("used_percent")
-                    secondary_reset = secondary.get("resets_at")
+
+                    next_latest: list[int | None] = [None, None, None, None]
+
+                    if isinstance(primary, dict) and isinstance(secondary, dict):
+                        primary_used = primary.get("used_percent")
+                        primary_reset = primary.get("resets_at")
+                        secondary_used = secondary.get("used_percent")
+                        secondary_reset = secondary.get("resets_at")
+                        next_latest = [
+                            int(primary_used) if isinstance(primary_used, (int, float)) else None,
+                            int(primary_reset) if isinstance(primary_reset, int) else None,
+                            int(secondary_used) if isinstance(secondary_used, (int, float)) else None,
+                            int(secondary_reset) if isinstance(secondary_reset, int) else None,
+                        ]
+                    else:
+                        single = primary if isinstance(primary, dict) else secondary
+                        used_percent = single.get("used_percent")
+                        resets_at = single.get("resets_at")
+                        window_minutes = single.get("window_minutes")
+                        parsed_used = int(used_percent) if isinstance(used_percent, (int, float)) else None
+                        parsed_reset = int(resets_at) if isinstance(resets_at, int) else None
+
+                        if window_minutes == 10080:
+                            next_latest[2] = parsed_used
+                            next_latest[3] = parsed_reset
+                        else:
+                            next_latest[0] = parsed_used
+                            next_latest[1] = parsed_reset
+
                     latest_ts = timestamp
-                    latest = (
-                        int(primary_used) if isinstance(primary_used, (int, float)) else None,
-                        int(primary_reset) if isinstance(primary_reset, int) else None,
-                        int(secondary_used) if isinstance(secondary_used, (int, float)) else None,
-                        int(secondary_reset) if isinstance(secondary_reset, int) else None,
-                    )
+                    latest = tuple(next_latest)
         except OSError:
             continue
     return latest

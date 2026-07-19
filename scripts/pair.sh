@@ -61,22 +61,45 @@ if [[ -z "${MAC}" ]]; then
 fi
 
 echo "Target device: ${MAC}"
-echo "Pairing (if stick shows passkey, enter it on host when prompted)..."
+echo "Preparing bluetoothctl agent..."
 
 bluetoothctl <<EOF
 power on
 agent on
 default-agent
 scan off
-pair ${MAC}
+quit
+EOF
+
+echo
+echo "Interactive pairing is required for Buddy passkey confirmation."
+echo "When bluetoothctl opens, run:"
+echo "  pair ${MAC}"
+echo "Then watch the Buddy, confirm the passkey flow, and type any requested"
+echo "code on the host. Once pairing succeeds, type:"
+echo "  quit"
+echo
+read -r -p "Press Enter to open interactive bluetoothctl pairing... " _
+bluetoothctl
+
+INFO="$(bluetoothctl info "${MAC}" 2>/dev/null || true)"
+PAIRED="$(printf '%s\n' "${INFO}" | awk -F': ' '/Paired:/ {print $2; exit}')"
+
+if [[ "${PAIRED}" != "yes" ]]; then
+    echo "warning: device is not paired yet. Re-run the script and complete the interactive pairing step." >&2
+    exit 2
+fi
+
+echo "Pairing succeeded; trusting the device and disconnecting it for bridge use..."
+
+bluetoothctl <<EOF
 trust ${MAC}
-connect ${MAC}
+disconnect ${MAC}
 info ${MAC}
 quit
 EOF
 
 INFO="$(bluetoothctl info "${MAC}" 2>/dev/null || true)"
-PAIRED="$(printf '%s\n' "${INFO}" | awk -F': ' '/Paired:/ {print $2; exit}')"
 TRUSTED="$(printf '%s\n' "${INFO}" | awk -F': ' '/Trusted:/ {print $2; exit}')"
 CONNECTED="$(printf '%s\n' "${INFO}" | awk -F': ' '/Connected:/ {print $2; exit}')"
 
@@ -91,4 +114,9 @@ if [[ "${PAIRED}" != "yes" || "${TRUSTED}" != "yes" ]]; then
     exit 2
 fi
 
-echo "Pairing complete."
+if [[ "${CONNECTED}" == "yes" ]]; then
+    echo "warning: device is still connected; disconnect it before handing BLE to the bridge." >&2
+    exit 3
+fi
+
+echo "Pairing complete; device is trusted and disconnected."
