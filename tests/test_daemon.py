@@ -76,6 +76,22 @@ def _latest_transport_with_lines():
     return next((transport for transport in reversed(FakeBleTransport.instances) if transport.lines), None)
 
 
+def _latest_snapshot():
+    transport = _latest_transport_with_lines()
+    if transport is None:
+        return None
+    return json.loads(transport.lines[-1])
+
+
+def _snapshot_with_tokens(tokens: int):
+    for transport in reversed(FakeBleTransport.instances):
+        for line in reversed(transport.lines):
+            snapshot = json.loads(line)
+            if snapshot.get("tokens") == tokens:
+                return snapshot
+    return None
+
+
 class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         FakeBleTransport.instances.clear()
@@ -106,6 +122,12 @@ class _OnDemandDaemonTestBase(unittest.IsolatedAsyncioTestCase):
             self.daemon._state_sync_task.cancel()
             try:
                 await self.daemon._state_sync_task
+            except asyncio.CancelledError:
+                pass
+        if self.daemon._session_scan_task is not None:
+            self.daemon._session_scan_task.cancel()
+            try:
+                await self.daemon._session_scan_task
             except asyncio.CancelledError:
                 pass
         if self.daemon._interactive_task is not None:
@@ -209,6 +231,30 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
             snapshot = json.loads(transport.lines[-1])
             self.assertEqual(snapshot["running"], 0)
             self.assertEqual(snapshot["waiting"], 0)
+
+    async def test_interactive_scan_does_not_force_full_rescan_each_tick(self):
+        self.daemon.config.interactive_scan_interval = 0.01
+        self.daemon.config.interactive_idle_scan_interval = 0.01
+        self.daemon.config.session_rescan_interval = 10.0
+        full_rescans = 0
+        interactive_scans = 0
+
+        async def fake_rescan(trigger_sync):
+            nonlocal full_rescans
+            full_rescans += 1
+
+        async def fake_interactive_scan():
+            nonlocal interactive_scans
+            interactive_scans += 1
+
+        self.daemon._rescan_session_total = fake_rescan
+        self.daemon._scan_interactive_from_sessions = fake_interactive_scan
+
+        self.daemon._ensure_background_tasks()
+        await asyncio.sleep(0.08)
+
+        self.assertEqual(full_rescans, 1)
+        self.assertGreaterEqual(interactive_scans, 3)
 
     async def test_user_prompt_submit_pushes_running_state_over_ble(self):
         await asyncio.to_thread(
@@ -1083,12 +1129,14 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
             {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t1", "stop_reason": "done"}},
         )
 
+        first_snapshot = None
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if len(FakeBleTransport.instances) >= 2 and FakeBleTransport.instances[-1].lines:
+            first_snapshot = _snapshot_with_tokens(120)
+            if first_snapshot is not None:
                 break
 
-        first_snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertIsNotNone(first_snapshot)
         self.assertEqual(first_snapshot["tokens"], 120)
         self.assertEqual(first_snapshot["tokens_today"], 120)
 
@@ -1110,12 +1158,14 @@ class PermissionRequestFlowTests(_OnDemandDaemonTestBase):
             {"event": "stop", "payload": {"session_id": "s1", "turn_id": "t2", "stop_reason": "done"}},
         )
 
+        snapshot = None
         for _ in range(80):
             await asyncio.sleep(0.02)
-            if FakeBleTransport.instances and FakeBleTransport.instances[-1].lines:
+            snapshot = _snapshot_with_tokens(50)
+            if snapshot is not None:
                 break
 
-        snapshot = json.loads(FakeBleTransport.instances[-1].lines[-1])
+        self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot["tokens"], 50)
         self.assertEqual(snapshot["tokens_today"], 170)
         ledger = json.loads(Path(self.config.token_ledger_path).read_text(encoding="utf-8"))

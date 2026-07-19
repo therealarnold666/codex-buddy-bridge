@@ -68,6 +68,7 @@ DEFAULT_INTERACTIVE_SCAN_INTERVAL_SECONDS = 1.0
 DEFAULT_INTERACTIVE_IDLE_SCAN_INTERVAL_SECONDS = 5.0
 DEFAULT_INTERACTIVE_CONNECT_TIMEOUT_SECONDS = 8.0
 DEFAULT_INTERACTIVE_INITIAL_TAIL_BYTES = 65536
+DEFAULT_INTERACTIVE_RECENT_FILE_LIMIT = 12
 SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
 
@@ -339,6 +340,7 @@ class DaemonConfig:
     interactive_scan_interval: float = DEFAULT_INTERACTIVE_SCAN_INTERVAL_SECONDS
     interactive_idle_scan_interval: float = DEFAULT_INTERACTIVE_IDLE_SCAN_INTERVAL_SECONDS
     interactive_connect_timeout: float = DEFAULT_INTERACTIVE_CONNECT_TIMEOUT_SECONDS
+    interactive_recent_file_limit: int = DEFAULT_INTERACTIVE_RECENT_FILE_LIMIT
 
 
 class TokenLedger:
@@ -420,6 +422,7 @@ class Daemon:
         self._session_file_offsets: dict[str, int] = {}
         self._session_turn_by_file: dict[str, str] = {}
         self._known_session_ids: set[str] = set()
+        self._recent_session_files: set[str] = set()
         self._interactive_calls: dict[str, InteractiveCallState] = {}
         self._interactive_snapshot = InteractiveSnapshot()
         self._interactive_event = asyncio.Event()
@@ -520,10 +523,12 @@ class Daemon:
             return None
 
         if event == "user_prompt_submit":
-            self._ensure_background_tasks()
             session_id = _string_or_none(body.get("session_id"))
             turn_id = _string_or_none(body.get("turn_id"))
-            if self._session.on_user_prompt_submit(session_id, turn_id):
+            changed = self._session.on_user_prompt_submit(session_id, turn_id)
+            await self._remember_session_file(session_id)
+            self._ensure_background_tasks()
+            if changed:
                 self._log.debug(
                     "Turn started: session=%s turn=%s running=%d waiting_out=%d",
                     session_id,
@@ -575,6 +580,7 @@ class Daemon:
             self._ensure_background_tasks()
             session_id = _string_or_none(body.get("session_id"))
             turn_id = _string_or_none(body.get("turn_id"))
+            await self._remember_session_file(session_id)
             token_delta = await self._collect_stop_token_delta(session_id)
             if token_delta:
                 self._session.add_pending_tokens(token_delta, self._token_ledger.today_tokens())
@@ -746,16 +752,23 @@ class Daemon:
         self._state_sync_event.set()
 
     async def _session_scan_loop(self) -> None:
+        loop = asyncio.get_running_loop()
         await self._rescan_session_total(trigger_sync=True)
+        next_full_rescan = loop.time() + self.config.session_rescan_interval
         while not self._stop_event.is_set():
             await self._scan_interactive_from_sessions()
+
+            if loop.time() >= next_full_rescan:
+                await self._rescan_session_total(trigger_sync=False)
+                next_full_rescan = loop.time() + self.config.session_rescan_interval
+
             try:
                 interval = (
                     self.config.interactive_scan_interval
                     if self._session.running > 0
                     else self.config.interactive_idle_scan_interval
                 )
-                timeout = min(self.config.session_rescan_interval, interval)
+                timeout = min(interval, max(0.0, next_full_rescan - loop.time()))
                 await asyncio.wait_for(
                     self._stop_event.wait(),
                     timeout=timeout,
@@ -763,15 +776,22 @@ class Daemon:
                 break
             except asyncio.TimeoutError:
                 pass
-            await self._rescan_session_total(trigger_sync=False)
 
     async def _rescan_session_total(self, trigger_sync: bool) -> None:
-        total = await asyncio.to_thread(_count_session_files, self.config.session_scan_path)
-        session_ids = await asyncio.to_thread(_list_session_ids, self.config.session_scan_path)
+        total, session_ids, recent_files = await asyncio.to_thread(
+            _scan_session_inventory,
+            self.config.session_scan_path,
+            self.config.interactive_recent_file_limit,
+        )
         rate_limits = await asyncio.to_thread(_scan_latest_rate_limits, self.config.session_scan_path)
         changed = self._session.set_total(total)
         removed_session_ids = self._known_session_ids - session_ids
         reconciled = self._session.reconcile_sessions(removed_session_ids) if removed_session_ids else False
+        self._recent_session_files = _merge_recent_session_files(
+            self._recent_session_files,
+            recent_files,
+            self._session_turn_by_file,
+        )
         usage_changed = self._session.set_rate_limits(*rate_limits)
         token_changed = await asyncio.to_thread(
             _refresh_token_ledger_from_sessions,
@@ -806,10 +826,18 @@ class Daemon:
             self._interactive_calls,
             self._session,
             self._log,
+            self._recent_session_files,
         )
         if changed:
             self._refresh_interactive_snapshot()
             self._request_state_sync()
+
+    async def _remember_session_file(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        session_path = await asyncio.to_thread(_find_session_file, self.config.session_scan_path, session_id)
+        if session_path is not None:
+            self._recent_session_files.add(str(session_path))
 
     async def _collect_stop_token_delta(self, session_id: str | None) -> int:
         if not session_id:
@@ -1444,6 +1472,42 @@ def _list_session_ids(scan_path: str) -> set[str]:
     return session_ids
 
 
+def _scan_session_inventory(scan_path: str, recent_limit: int) -> tuple[int, set[str], set[str]]:
+    root = Path(scan_path).expanduser()
+    if not root.exists():
+        return (0, set(), set())
+
+    session_ids: set[str] = set()
+    candidates: list[tuple[float, str]] = []
+    total = 0
+    for path in root.rglob("*.jsonl"):
+        if not path.is_file():
+            continue
+        total += 1
+        path_str = str(path)
+        session_id = _session_id_from_path(path_str)
+        if session_id:
+            session_ids.add(session_id)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, path_str))
+
+    limit = max(1, recent_limit)
+    candidates.sort(reverse=True)
+    return (total, session_ids, {path for _, path in candidates[:limit]})
+
+
+def _merge_recent_session_files(
+    existing: set[str],
+    scanned_recent: set[str],
+    turn_by_file: dict[str, str],
+) -> set[str]:
+    active_files = {path for path in turn_by_file if path in existing or Path(path).exists()}
+    return set(scanned_recent) | active_files
+
+
 def _scan_session_output_tokens(path: Path) -> int:
     best = 0
     try:
@@ -1585,18 +1649,20 @@ def _scan_interactive_events_from_files(
     interactive_calls: dict[str, InteractiveCallState],
     session_state: SessionState,
     log: logging.Logger,
+    session_files: set[str] | None = None,
 ) -> bool:
     root = Path(scan_path).expanduser()
     if not root.exists():
         return False
     changed = False
-    files = [str(path) for path in root.rglob("*.jsonl") if path.is_file()]
-    known = set(offsets.keys())
-    current = set(files)
-    for removed in known - current:
+    if session_files is None:
+        session_files = {str(path) for path in root.rglob("*.jsonl") if path.is_file()}
+    files = sorted(session_files)
+    current = {fp for fp in files if Path(fp).is_file()}
+    for removed in set(files) - current:
         offsets.pop(removed, None)
         turn_by_file.pop(removed, None)
-    for fp in files:
+    for fp in sorted(current):
         session_id = _session_id_from_path(fp)
         if session_id is None:
             continue
